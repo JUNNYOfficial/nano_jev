@@ -1,0 +1,22 @@
+# Python 运行与缓存产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 测试与类型检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 编辑器 / 操作系统噪声
+.DS_Store
+.idea/
+.vscode/
