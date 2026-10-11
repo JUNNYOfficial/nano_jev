@@ -1,0 +1,72 @@
+# nano_jev —— 项目配置（打包、测试、lint、类型检查）
+#
+# 本仓库刻意采用「仓库名即包名」的扁平布局：仓库根目录本身就是一个可导入的
+# ``nano_jev`` 包（``__init__.py`` 在根）。故下面用 ``package-dir`` 把根目录映射
+# 成 ``nano_jev`` 包，这样既能整包复制直接跑，也能 ``pip install`` 安装。
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-jev"
+description = "可整包复制的 Jev 平替：零依赖、确定性的语义粗筛服务"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "JUNNYOfficial" }]
+keywords = ["jev", "jev-arena", "classification", "deterministic", "zero-dependency"]
+dependencies = []
+dynamic = ["version"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Linguistic",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.5", "mypy>=1.8"]
+
+[project.scripts]
+nano-jev = "nano_jev.nj_server:main"
+
+[project.urls]
+Repository = "https://github.com/JUNNYOfficial/nano_jev"
+Issues = "https://github.com/JUNNYOfficial/nano_jev/issues"
+
+[tool.setuptools]
+packages = ["nano_jev"]
+include-package-data = false
+
+[tool.setuptools.package-dir]
+nano_jev = "."
+
+[tool.setuptools.dynamic]
+version = { attr = "nano_jev.VERSION" }
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF", "A"]
+# RUF001/2/3（歧义 Unicode）对中文注释与中文字符串属于系统性误报，关掉。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.mypy]
+python_version = "3.9"
+files = ["."]
+ignore_missing_imports = true
+warn_unused_configs = true

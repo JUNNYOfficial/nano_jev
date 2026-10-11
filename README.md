@@ -18,13 +18,16 @@
 * `nano_jev` 回答「这条内容大概属于哪一类」。
 
 本项目**零依赖**：不依赖任何第三方包，也不依赖 `nano/` 的 C++ 内核，可整包复制到
-任意有 Python 3.10+ 的机器上单跑。
+任意有 **Python 3.9+** 的机器上单跑（已在 3.9 上验证）。
 
 ## 快速开始
 
+两种用法，二选一：
+
+**A. 直接当脚本跑**（先整包复制/克隆，再在它的**父目录**运行，让 `nano_jev` 成为可
+导入的包）：
+
 ```bash
-# 本仓库本身就叫 nano_jev（即包名），所以要在它的**父目录**运行，
-# 让 `nano_jev` 成为一个可导入的包（克隆后 `cd ..` 即可）：
 cd ..            # 使当前目录下能看到 nano_jev/ 这个文件夹
 python3 -m nano_jev.nj_server serve --port 8765
 
@@ -37,6 +40,14 @@ python3 -m nano_jev.nj_server label "这个模型回答准确，速度快，但�
 # 回放一份 decisions 请求（读文件或 stdin）
 python3 -m nano_jev.nj_server decide --file req.json
 ```
+
+**B. 安装成包**（`pyproject.toml` 已配好，装完多一个 `nano-jev` 命令）：
+
+```bash
+pip install .                 # 或 pip install -e . 做可编辑安装
+nano-jev serve --port 8765    # 等价于 python -m nano_jev.nj_server
+```
+
 
 ## 接进 jev-arena（两种方式）
 
@@ -97,8 +108,9 @@ python -m nano_jev.nj_server decide [--file req.json] [--topics ...]
 | `nj_lexicon.py` | 中英双语的极性/意图/维度/情绪/主题线索（唯一需要扩充的地方） |
 | `nj_engine.py` | 粗筛引擎：一条文本 → 一套结构化标签（纯函数、确定性） |
 | `nj_contract.py` | Jev `/alpha/decisions` 契约的解析与响应构造 |
-| `nj_openai.py` | OpenAI `/chat/completions` 适配层 |
+| `nj_openai.py` | OpenAI `/chat/completions` 适配层（含流式 SSE） |
 | `nj_server.py` | 零依赖 HTTP 服务与命令行入口 |
+| `pyproject.toml` | 打包元数据 + pytest / ruff / mypy 配置 |
 
 ## 架构与数据流
 
@@ -188,6 +200,20 @@ python3 -m pytest nano_jev/ -q
 ```bash
 python3 -m pytest nano_jev/test_nj_engine.py nano_jev/test_nj_contract.py nano_jev/test_nj_openai.py -q
 python3 -m pytest nano_jev/test_nj_server.py -q
+```
+
+安装后也可直接 `pytest`（配置见 `pyproject.toml`）。
+
+## 开发与质量配置
+
+`pyproject.toml` 里统一放了打包与工具配置（都用同一套 `py39` 目标）：
+
+```bash
+pip install -e ".[dev]"     # 装 pytest / ruff / mypy
+
+ruff check .                # 静态检查（select E,F,W,I,N,UP,B,SIM,RUF,A）
+mypy                        # 类型检查（无第三方依赖，近乎零噪音）
+pytest                      # 单元 + 端到端（真起服务的 HTTP 测试）
 ```
 
 ## 局限（如实写清）

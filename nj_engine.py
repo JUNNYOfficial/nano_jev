@@ -11,8 +11,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from . import nj_lexicon as lx
 from .nj_vocab import ASPECTS, EMOTIONS, INTENTS, MAX_ASPECTS, MAX_EMOTIONS
@@ -81,10 +82,10 @@ class Label:
     sentiment_score: float
     confidence: float
     intent: str
-    aspects: list[str] = field(default_factory=list)
-    emotion: list[str] = field(default_factory=list)
+    aspects: list[str] = field(default_factory=list[str])
+    emotion: list[str] = field(default_factory=list[str])
     evidence_quote: str = ""
-    meta: dict[str, Any] = field(default_factory=dict)
+    meta: dict[str, Any] = field(default_factory=dict[str, Any])
 
     def to_raw(self) -> dict[str, Any]:
         """转成 jev-arena 在 ``normalizeLabel`` 前期望的原始字段字典。"""
@@ -122,7 +123,7 @@ def _sentiment_of(score: float, pos_hits: int, neg_hits: int) -> str:
     return "neutral"
 
 
-def _best_by_cues(text: str, cues: dict[str, Sequence[str]], order: Iterable[str]) -> tuple[str, int]:
+def _best_by_cues(text: str, cues: Mapping[str, Sequence[str]], order: Iterable[str]) -> tuple[str, int]:
     """按命中数取线索字典里的最好的 key；并列时按 ``order`` 的先后决定。"""
     order_list = list(order)
     best_key = ""
@@ -135,7 +136,9 @@ def _best_by_cues(text: str, cues: dict[str, Sequence[str]], order: Iterable[str
     return best_key, best_hits
 
 
-def _ranked_by_cues(text: str, cues: dict[str, Sequence[str]], order: Iterable[str], limit: int) -> list[str]:
+def _ranked_by_cues(
+    text: str, cues: Mapping[str, Sequence[str]], order: Iterable[str], limit: int
+) -> list[str]:
     """按命中数降序取前 ``limit`` 个 key；命中数为 0 的不计入。"""
     scored: list[tuple[str, int, int]] = []
     for rank, key in enumerate(order):

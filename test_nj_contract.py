@@ -167,6 +167,8 @@ def test_to_enum_and_list_normalizers():
     assert to_enum("Positive", SENTIMENTS) == ("positive", True)
     assert to_enum("正面", SENTIMENTS, {"正面": "positive"}) == ("positive", True)
     assert to_enum("完全没见过", INTENTS) == ("other", True)
+    # 别名指向词表外的值时，必须回落 fallback，绝不能把表外值透出。
+    assert to_enum("weird", SENTIMENTS, {"weird": "not_a_sentiment"}) == ("other", True)
 
     kept, dropped, truncated = to_aspects(["capability", "未知维度", "price"])
     assert kept == ["capability", "price"]

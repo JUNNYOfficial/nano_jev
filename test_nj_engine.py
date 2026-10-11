@@ -4,6 +4,10 @@
 褒贬/意图/维度/情绪的判据要能在测试里说清楚，而不是"跑出来是什么就是什么"。
 """
 
+# 下面的 nano_jev.* 导入依赖运行时注入的 sys.path（见 REPO_ROOT），静态检查器
+# 无法跟踪这种动态路径，故在本文件内关闭 reportMissingImports。
+# pyright: reportMissingImports=false
+
 from __future__ import annotations
 
 import pathlib

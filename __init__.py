@@ -38,13 +38,13 @@ from .nj_vocab import ASPECTS, EMOTIONS, INTENTS, MAX_ASPECTS, MAX_EMOTIONS, SEN
 
 __all__ = [
     "ASPECTS",
-    "DecisionsRequest",
     "EMOTIONS",
     "INTENTS",
-    "Label",
     "MAX_ASPECTS",
     "MAX_EMOTIONS",
     "SENTIMENTS",
+    "DecisionsRequest",
+    "Label",
     "build_answers",
     "build_decisions_response",
     "classify",

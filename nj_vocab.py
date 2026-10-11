@@ -10,7 +10,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any, cast
 
 #: 整体态度（单选）。
 SENTIMENTS: tuple[str, ...] = ("positive", "negative", "neutral", "mixed")
@@ -159,6 +160,17 @@ def _fold(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
+def _as_items(raw: Any) -> list[Any]:
+    """把入参安全收敛成列表（非 ``list``/``tuple`` 一律当空）。
+
+    ``isinstance`` 收窄后类型检查器只知道是 ``list``/``tuple`` 而推不出元素类型，
+    故显式 ``cast``，避免 ``reportUnknownArgumentType``。
+    """
+    if isinstance(raw, (list, tuple)):
+        return list(cast("Iterable[Any]", raw))
+    return []
+
+
 def to_enum(
     raw: Any,
     allowed: Iterable[str],
@@ -178,7 +190,7 @@ def to_enum(
         return text, False
     if aliases:
         mapped = aliases.get(lower) or aliases.get(text)
-        if mapped is not None and mapped in allowed_set:
+        if mapped and mapped in allowed_set:
             return mapped, True
     return fallback, True
 
@@ -189,22 +201,22 @@ def to_aspects(raw: Any) -> tuple[list[str], int, int]:
     **先丢未知项再截断**：否则一个词表外的值会把合法项挤出上限。支持上游实测会
     出现的对象数组写法（``[{"aspect": ...}]``）。
     """
-    items = raw if isinstance(raw, (list, tuple)) else []
+    items: list[Any] = _as_items(raw)
     known: list[str] = []
     dropped = 0
     for item in items:
         key: Any = item
         if isinstance(item, dict):
-            key = item.get("aspect") or item.get("key") or item.get("name")
+            fields = cast("dict[str, Any]", item)
+            key = fields.get("aspect") or fields.get("key") or fields.get("name")
         text = _fold(key)
         if not text:
             dropped += 1
             continue
         lower = text.lower()
-        if lower in ASPECTS:
-            resolved = lower
-        else:
-            resolved = _ASPECT_ALIASES.get(lower) or _ASPECT_ALIASES.get(text)
+        resolved: str | None = (
+            lower if lower in ASPECTS else _ASPECT_ALIASES.get(lower) or _ASPECT_ALIASES.get(text)
+        )
         if not resolved or resolved not in ASPECTS:
             dropped += 1
             continue
@@ -216,21 +228,21 @@ def to_aspects(raw: Any) -> tuple[list[str], int, int]:
 
 def to_emotions(raw: Any) -> tuple[list[str], int, int]:
     """收敛情绪列表，返回 ``(保留项, 丢弃数, 截断数)``；口径同 :func:`to_aspects`。"""
-    items = raw if isinstance(raw, (list, tuple)) else []
+    items: list[Any] = _as_items(raw)
     kept: list[str] = []
     dropped = 0
     for item in items:
         key: Any = item
         if isinstance(item, dict):
-            key = item.get("emotion") or item.get("label")
+            fields = cast("dict[str, Any]", item)
+            key = fields.get("emotion") or fields.get("label") or fields.get("name")
         text = _fold(key)
         if not text:
             dropped += 1
             continue
-        if text in EMOTIONS:
-            resolved = text
-        else:
-            resolved = _EMOTION_ALIASES.get(text.lower()) or _EMOTION_ALIASES.get(text)
+        resolved: str | None = (
+            text if text in EMOTIONS else _EMOTION_ALIASES.get(text.lower()) or _EMOTION_ALIASES.get(text)
+        )
         if not resolved or resolved not in EMOTIONS:
             dropped += 1
             continue

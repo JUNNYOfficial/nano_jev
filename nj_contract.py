@@ -21,8 +21,9 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, cast
 
 from . import nj_lexicon as lx
 from .nj_engine import Label, classify, estimate_tokens
@@ -44,13 +45,33 @@ class DecisionsRequest:
     questions: dict[str, dict[str, Any]]
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """把任意值收敛成 ``dict[str, Any]``（非 dict 一律空）。
+
+    ``Any`` 经 ``isinstance(x, dict)`` 收窄后会变成 ``dict[Unknown, Unknown]``，
+    之后每次 ``.get()``/``.keys()`` 都是"部分未知"。这里显式 ``cast`` 成
+    ``dict[str, Any]``，让取值落回 ``Any``（Pylance 认 ``Any``，不认 ``Unknown``）。
+    """
+    if isinstance(value, dict):
+        return cast("dict[str, Any]", value)
+    return {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    """把任意值收敛成 ``list[Any]``（非 list/tuple 一律空）。"""
+    if isinstance(value, (list, tuple)):
+        return list(cast("Iterable[Any]", value))
+    return []
+
+
 def _coerce_comments(state: Any) -> list[dict[str, Any]]:
     """把 ``state`` 收敛成统一的评论列表；``state`` 不是标准形状时尽力兜底。"""
-    raw: Any = None
-    if isinstance(state, dict) and isinstance(state.get("comments"), list):
-        raw = state["comments"]
+    raw: list[Any] | None = None
+    candidate = _as_dict(state).get("comments")
+    if isinstance(candidate, list):
+        raw = _as_list(candidate)
     elif isinstance(state, list):
-        raw = state
+        raw = _as_list(state)
 
     if raw is None:
         content = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
@@ -59,12 +80,13 @@ def _coerce_comments(state: Any) -> list[dict[str, Any]]:
     comments: list[dict[str, Any]] = []
     for index, item in enumerate(raw):
         if isinstance(item, dict):
+            row = _as_dict(item)
             comments.append(
                 {
-                    "comment_id": str(item.get("comment_id", item.get("id", index))),
-                    "content": str(item.get("content", "")),
-                    "topic_title": str(item.get("topic_title", "")),
-                    "like_count": item.get("like_count", 0),
+                    "comment_id": str(row.get("comment_id", row.get("id", index))),
+                    "content": str(row.get("content", "")),
+                    "topic_title": str(row.get("topic_title", "")),
+                    "like_count": row.get("like_count", 0),
                 }
             )
         else:
@@ -76,15 +98,12 @@ def _coerce_comments(state: Any) -> list[dict[str, Any]]:
 
 def parse_decisions_request(body: Any) -> DecisionsRequest:
     """解析 ``/alpha/decisions`` 的请求体。缺字段时给安全默认值，**不抛异常**。"""
-    if not isinstance(body, dict):
-        body = {}
-    model = str(body.get("model") or "nano-jev")
-    comments = _coerce_comments(body.get("state"))
-    questions_raw = body.get("questions")
+    data = _as_dict(body)
+    model = str(data.get("model") or "nano-jev")
+    comments = _coerce_comments(data.get("state"))
     questions: dict[str, dict[str, Any]] = {}
-    if isinstance(questions_raw, dict):
-        for qid, question in questions_raw.items():
-            questions[str(qid)] = question if isinstance(question, dict) else {"type": "noul"}
+    for qid, question in _as_dict(data.get("questions")).items():
+        questions[str(qid)] = _as_dict(question) if isinstance(question, dict) else {"type": "noul"}
     return DecisionsRequest(model=model, comments=comments, questions=questions)
 
 
@@ -134,7 +153,7 @@ def _role_from_question(question: dict[str, Any]) -> tuple[str, str | None]:
     criteria = question.get("criteria")
     instructions = str(question.get("instructions") or "")
     if qtype == "choice" and isinstance(criteria, dict):
-        keys = set(criteria.keys())
+        keys = set(_as_dict(criteria).keys())
         if keys and keys <= set(SENTIMENTS):
             return "sentiment", None
         if keys and keys <= set(INTENTS):
@@ -183,7 +202,7 @@ def _score_answer(label: Label, criteria: Sequence[Any]) -> dict[str, Any]:
     """构造 ``score`` 答案：档位下标由 ``sentiment_score`` 线性映射而来。"""
     n = len(criteria) if criteria else 5
     index = (label.sentiment_score + 1.0) / 2.0 * (n - 1)
-    weights = []
+    weights: list[float] = []
     for i in range(n):
         weights.append(2.718281828459045 ** (-((i - index) ** 2) / (2.0 * _SCORE_SIGMA**2)))
     total = sum(weights) or 1.0
@@ -208,10 +227,10 @@ def _fallback_answer(question: dict[str, Any]) -> dict[str, Any]:
     qtype = str(question.get("type") or "").lower()
     criteria = question.get("criteria")
     if qtype in {"choice"} and isinstance(criteria, dict) and criteria:
-        keys = list(criteria.keys())
+        keys = list(_as_dict(criteria).keys())
         return _choice_answer(keys[0], keys, 0.2)
     if qtype == "score":
-        labels = criteria if isinstance(criteria, list) else ["0", "1", "2", "3", "4"]
+        labels: list[Any] = _as_list(criteria) if isinstance(criteria, list) else ["0", "1", "2", "3", "4"]
         return _score_answer(Label("", False, "neutral", 0.0, 0.2, "other"), labels)
     return _noul_answer(0.5)
 
@@ -246,7 +265,7 @@ def _answer_for(
         return _choice_answer(label.intent, INTENTS, label.confidence)
     if role == "score":
         criteria = question.get("criteria")
-        return _score_answer(label, criteria if isinstance(criteria, list) else [])
+        return _score_answer(label, _as_list(criteria))
     if role == "aspect":
         resolved = _resolve_key(key, list(ASPECTS.keys()))
         return _noul_answer(0.85 if resolved and resolved in label.aspects else 0.12)
@@ -275,7 +294,10 @@ def build_decisions_response(
 ) -> dict[str, Any]:
     """拼出与 Jev 同形状的响应体（``answers`` / ``usage`` / ``id`` / ``provider``）。"""
     answers = build_answers(request, labels)
-    payload_in = {"state": {"comments": request.comments}, "questions": request.questions}
+    payload_in: dict[str, Any] = {
+        "state": {"comments": request.comments},
+        "questions": request.questions,
+    }
     input_tokens = estimate_tokens(json.dumps(payload_in, ensure_ascii=False))
     output_tokens = estimate_tokens(json.dumps(answers, ensure_ascii=False))
     return {

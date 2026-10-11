@@ -15,10 +15,12 @@ jev-arena 的本地开源版除 Jev 协议外还支持 ``openai`` 协议（右�
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 import uuid
-from typing import Any, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from typing import Any, cast
 
 from .nj_engine import Label, classify, estimate_tokens
 
@@ -29,61 +31,79 @@ _COMMENTS_KEY = "comments"
 _MAX_N = 8
 
 
-def _message_text(messages: Any) -> str:
+def _as_dict(value: Any) -> dict[str, object]:
+    """把任意值收敛成 ``dict[str, object]``（非 dict 一律空）。
+
+    ``Any`` 经 ``isinstance(x, dict)`` 收窄后会变成 ``dict[Unknown, Unknown]``，
+    之后每次 ``.get()`` 都是"部分未知"。这里显式 ``cast`` 成 ``dict[str, object]``，
+    让取键结果落回已知类型 ``object``（配合下方各处的 ``isinstance`` 再收窄）。
+    """
+    if isinstance(value, dict):
+        return cast("dict[str, object]", value)
+    return {}
+
+
+def _as_list(value: Any) -> list[object]:
+    """把任意值收敛成 ``list[object]``（非 list/tuple 一律空）。"""
+    if isinstance(value, (list, tuple)):
+        return list(cast("Iterable[object]", value))
+    return []
+
+
+def _message_text(messages: object) -> str:
     """取最后一条 ``user`` 消息的纯文本（多模态 content 只拼文本片段）。"""
     text = ""
-    if not isinstance(messages, list):
-        return text
-    for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "user":
+    for message in _as_list(messages):
+        msg = _as_dict(message)
+        if msg.get("role") != "user":
             continue
-        content = message.get("content")
+        content = msg.get("content")
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
-            parts = [
+            text = "".join(
                 str(part.get("text", ""))
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            ]
-            text = "".join(parts)
+                for part in (_as_dict(item) for item in _as_list(content))
+                if part.get("type") == "text"
+            )
     return text
 
 
-def _find_comments_object(text: str) -> dict[str, Any] | None:
+def _find_comments_object(text: str) -> dict[str, object] | None:
     """在任意文本里找出**最后一个**含 ``comments`` 数组的 JSON 对象。"""
     decoder = json.JSONDecoder()
-    best: dict[str, Any] | None = None
+    best: dict[str, object] | None = None
     index = text.find("{")
     while index != -1:
-        try:
-            obj, _end = decoder.raw_decode(text, index)
-        except ValueError:
-            obj = None
-        if isinstance(obj, dict) and isinstance(obj.get(_COMMENTS_KEY), list):
+        decoded: object = None
+        with contextlib.suppress(ValueError):
+            decoded, _end = decoder.raw_decode(text, index)
+        obj = _as_dict(decoded)
+        if isinstance(obj.get(_COMMENTS_KEY), list):
             best = obj
         index = text.find("{", index + 1)
     return best
 
 
-def _coerce_comment(item: Any, index: int) -> dict[str, Any]:
+def _coerce_comment(item: object, index: int) -> dict[str, Any]:
     """把数组里的一个元素收敛成标准评论字典。"""
     if isinstance(item, dict):
+        obj = _as_dict(item)
         return {
-            "comment_id": str(item.get("comment_id", item.get("id", index))),
-            "content": str(item.get("content", "")),
-            "topic_title": str(item.get("topic_title", "")),
-            "like_count": item.get("like_count", 0),
+            "comment_id": str(obj.get("comment_id", obj.get("id", index))),
+            "content": str(obj.get("content", "")),
+            "topic_title": str(obj.get("topic_title", "")),
+            "like_count": obj.get("like_count", 0),
         }
     return {"comment_id": str(index), "content": str(item), "topic_title": "", "like_count": 0}
 
 
-def extract_comments(messages: Any) -> list[dict[str, Any]]:
+def extract_comments(messages: object) -> list[dict[str, Any]]:
     """从消息里抽出评论列表；抽不到就把整段用户文本当成单条评论。"""
     text = _message_text(messages)
     obj = _find_comments_object(text)
     if obj is not None:
-        raw = obj[_COMMENTS_KEY]
+        raw = _as_list(obj.get(_COMMENTS_KEY))
         return [_coerce_comment(item, index) for index, item in enumerate(raw)]
     if text.strip():
         return [{"comment_id": "0", "content": text, "topic_title": "", "like_count": 0}]
@@ -99,9 +119,9 @@ def coerce_n(value: Any) -> int:
     return max(1, min(_MAX_N, parsed))
 
 
-def wants_stream(body: Any) -> bool:
+def wants_stream(body: object) -> bool:
     """请求是否显式要求 SSE 增量返回（``"stream": true``）。"""
-    return isinstance(body, dict) and body.get("stream") is True
+    return _as_dict(body).get("stream") is True
 
 
 def labels_content(labels: Sequence[Label]) -> str:
@@ -152,7 +172,7 @@ def iter_stream_chunks(labels: Sequence[Label], model: str, n: int = 1) -> Itera
     content = labels_content(labels)
 
     def frame(deltas: list[dict[str, Any]], finish: str | None) -> str:
-        payload = {
+        payload: dict[str, Any] = {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
@@ -170,7 +190,7 @@ def iter_stream_chunks(labels: Sequence[Label], model: str, n: int = 1) -> Itera
     yield "data: [DONE]\n\n"
 
 
-def _classify_messages(messages: Any, topics: Sequence[str] | None) -> list[Label]:
+def _classify_messages(messages: object, topics: Sequence[str] | None) -> list[Label]:
     """抽出评论并逐条粗筛，供整包与流式两条路径共用。"""
     return [
         classify(
@@ -186,19 +206,17 @@ def _classify_messages(messages: Any, topics: Sequence[str] | None) -> list[Labe
 
 def handle_chat(body: Any, topics: Sequence[str] | None = None) -> dict[str, Any]:
     """一站式入口：解析 chat 请求 → 抽评论 → 粗筛 → 拼整包响应。"""
-    if not isinstance(body, dict):
-        body = {}
-    model = str(body.get("model") or "nano-jev")
-    messages = body.get("messages")
+    data = _as_dict(body)
+    model = str(data.get("model") or "nano-jev")
+    messages = data.get("messages")
     labels = _classify_messages(messages, topics)
     prompt_tokens = estimate_tokens(json.dumps(messages, ensure_ascii=False))
-    return build_chat_completion(labels, model, prompt_tokens, n=body.get("n", 1))
+    return build_chat_completion(labels, model, prompt_tokens, n=coerce_n(data.get("n", 1)))
 
 
 def handle_chat_stream(body: Any, topics: Sequence[str] | None = None) -> Iterator[str]:
     """一站式流式入口：解析 chat 请求 → 粗筛 → 产出 SSE 帧。"""
-    if not isinstance(body, dict):
-        body = {}
-    model = str(body.get("model") or "nano-jev")
-    labels = _classify_messages(body.get("messages"), topics)
-    return iter_stream_chunks(labels, model, n=body.get("n", 1))
+    data = _as_dict(body)
+    model = str(data.get("model") or "nano-jev")
+    labels = _classify_messages(data.get("messages"), topics)
+    return iter_stream_chunks(labels, model, n=coerce_n(data.get("n", 1)))

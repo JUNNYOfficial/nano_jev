@@ -7,6 +7,7 @@ jev-arena 指着用"这件事才算被端到端验证过（契约测试只测了
 
 from __future__ import annotations
 
+import http.client
 import json
 import pathlib
 import sys
@@ -14,6 +15,7 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -32,6 +34,8 @@ def server_url() -> Iterator[str]:
     """在随机端口起一个真实服务，测试结束再关掉。"""
     httpd = nj_server.make_server("127.0.0.1", 0)
     host, port = httpd.server_address[0], httpd.server_address[1]
+    if isinstance(host, bytes):
+        host = host.decode("utf-8", "replace")
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -42,7 +46,31 @@ def server_url() -> Iterator[str]:
         thread.join(timeout=5)
 
 
-def _post(url: str, payload: dict) -> tuple[int, dict]:
+@pytest.fixture()
+def secured_server_url() -> Iterator[str]:
+    """带访问令牌的服务；用于验证鉴权，以及 401 后 keep-alive 连接不被污染。"""
+    previous = nj_server._token
+    nj_server._token = "s3cret"
+    httpd = nj_server.make_server("127.0.0.1", 0)
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    if isinstance(host, bytes):
+        host = host.decode("utf-8", "replace")
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://{host}:{port}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+        nj_server._token = previous
+
+
+def _auth_headers(token: str) -> dict[str, str]:
+    return {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+
+
+def _post(url: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
@@ -51,12 +79,12 @@ def _post(url: str, payload: dict) -> tuple[int, dict]:
         return response.status, json.loads(response.read().decode("utf-8"))
 
 
-def _get(url: str) -> tuple[int, dict]:
+def _get(url: str) -> tuple[int, dict[str, Any]]:
     with _OPENER.open(url, timeout=5) as response:
         return response.status, json.loads(response.read().decode("utf-8"))
 
 
-def _post_text(url: str, payload: dict) -> tuple[int, dict, str]:
+def _post_text(url: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any], str]:
     """POST 并保留原始文本与响应头（流式响应不是单个 JSON 对象，需原样取回）。"""
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -66,7 +94,7 @@ def _post_text(url: str, payload: dict) -> tuple[int, dict, str]:
         return response.status, dict(response.headers), response.read().decode("utf-8")
 
 
-def _decisions_body() -> dict:
+def _decisions_body() -> dict[str, Any]:
     return {
         "model": "typesafe/jev-1.13",
         "state": {
@@ -202,3 +230,41 @@ def test_bad_json_returns_400(server_url: str):
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         _OPENER.open(request, timeout=5)
     assert excinfo.value.code == 400
+
+
+def test_auth_token_enforced(secured_server_url: str):
+    # 未带令牌 → 401
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(secured_server_url + "/alpha/decisions", _decisions_body())
+    assert excinfo.value.code == 401
+
+    # 正确令牌 → 200
+    data = json.dumps(_decisions_body()).encode("utf-8")
+    request = urllib.request.Request(
+        secured_server_url + "/alpha/decisions",
+        data=data,
+        headers=_auth_headers("s3cret"),
+        method="POST",
+    )
+    with _OPENER.open(request, timeout=5) as response:
+        assert response.status == 200
+
+
+def test_unauthorized_keeps_connection_usable(secured_server_url: str):
+    """回归：401 若未读完请求体，HTTP/1.1 keep-alive 的下一个请求会被污染。"""
+    host, _, port = secured_server_url[len("http://") :].partition(":")
+    body = json.dumps(_decisions_body())
+    conn = http.client.HTTPConnection(host, int(port), timeout=5)
+    try:
+        conn.request("POST", "/alpha/decisions", body=body, headers=_auth_headers("wrong"))
+        first = conn.getresponse()
+        first.read()
+        assert first.status == 401
+
+        conn.request("POST", "/alpha/decisions", body=body, headers=_auth_headers("s3cret"))
+        second = conn.getresponse()
+        payload = json.loads(second.read().decode("utf-8"))
+        assert second.status == 200
+        assert payload["provider"] == "NanoJev"
+    finally:
+        conn.close()

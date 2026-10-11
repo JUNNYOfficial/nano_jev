@@ -19,8 +19,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Iterable, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Iterable, Sequence
+from typing import Any
 from urllib.parse import urlparse
 
 from . import VERSION
@@ -29,10 +30,10 @@ from .nj_engine import classify
 from .nj_openai import handle_chat, handle_chat_stream, wants_stream
 
 #: 相关性判据用的主题词（可被 CLI/环境变量覆盖）。
-_TOPICS: tuple[str, ...] = tuple(DEFAULT_TOPICS)
+_topics: tuple[str, ...] = tuple(DEFAULT_TOPICS)
 
 #: 可选的访问令牌；为空表示不鉴权。
-_TOKEN: str | None = None
+_token: str | None = None
 
 #: 对外暴露的模型对象（OpenAI 风格），``/v1/models`` 与其子路径共用。
 _MODEL: dict[str, Any] = {"id": "nano-jev", "object": "model", "owned_by": "nano_jev"}
@@ -88,15 +89,15 @@ class _Handler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8"))
 
     def _authorized(self) -> bool:
-        if not _TOKEN:
+        if not _token:
             return True
         header = self.headers.get("Authorization") or ""
-        return header.strip() == f"Bearer {_TOKEN}"
+        return header.strip() == f"Bearer {_token}"
 
     def _path(self) -> str:
         return urlparse(self.path).path.rstrip("/") or "/"
 
-    def do_GET(self) -> None:  # noqa: N802  （BaseHTTPRequestHandler 约定名）
+    def do_GET(self) -> None:
         path = self._path()
         if path.endswith("/health"):
             self._send_json({"status": "ok", "version": VERSION, "backend": "nano-jev"})
@@ -125,14 +126,16 @@ class _Handler(BaseHTTPRequestHandler):
             }
         )
 
-    def do_POST(self) -> None:  # noqa: N802  （BaseHTTPRequestHandler 约定名）
-        if not self._authorized():
-            self._send_error_json("未授权", 401, 401)
-            return
+    def do_POST(self) -> None:
+        # 先读完请求体：否则在 HTTP/1.1 keep-alive 下，返回错误响应时残留在缓冲区
+        # 的请求体会被当成下一个请求来解析，污染同一条连接（原 401 分支就有此 bug）。
         try:
             body = self._read_body()
         except (ValueError, UnicodeDecodeError) as exc:
             self._send_error_json(f"请求体不是合法 JSON：{exc}", 400, 400)
+            return
+        if not self._authorized():
+            self._send_error_json("未授权", 401, 401)
             return
 
         path = self._path()
@@ -140,18 +143,18 @@ class _Handler(BaseHTTPRequestHandler):
         stream_chunks: Iterable[str] | None = None
         try:
             if path.endswith("/alpha/decisions"):
-                payload = handle_decisions(body, _TOPICS)
+                payload = handle_decisions(body, _topics)
             elif path.endswith("/chat/completions"):
                 if wants_stream(body):
                     # 分类在 handle_chat_stream() 内同步完成，故错误仍能被下面捕获；
                     # 逐帧写出放到 try 之外，避免半途写失败后再补发 JSON 头。
-                    stream_chunks = handle_chat_stream(body, _TOPICS)
+                    stream_chunks = handle_chat_stream(body, _topics)
                 else:
-                    payload = handle_chat(body, _TOPICS)
+                    payload = handle_chat(body, _topics)
             else:
                 self._send_error_json(f"未知路径：{path}", 404, 404)
                 return
-        except Exception as exc:  # noqa: BLE001  （服务端兜底：任何异常都转成契约错误）
+        except Exception as exc:
             self._send_error_json(f"内部错误：{exc}", 500, 500)
             return
         if stream_chunks is not None:
@@ -167,13 +170,15 @@ def make_server(host: str, port: int) -> ThreadingHTTPServer:
 
 def serve(host: str, port: int, topics: Sequence[str] | None = None, token: str | None = None) -> None:
     """启动服务并阻塞运行。"""
-    global _TOPICS, _TOKEN
+    global _topics, _token
     if topics:
-        _TOPICS = tuple(topics)
-    _TOKEN = token
+        _topics = tuple(topics)
+    _token = token
     httpd = make_server(host, port)
-    bound = httpd.server_address
-    print(f"nano_jev 服务已启动：http://{bound[0]}:{bound[1]}（版本 {VERSION}）", file=sys.stderr)
+    bound_host, bound_port = httpd.server_address[0], httpd.server_address[1]
+    if isinstance(bound_host, bytes):
+        bound_host = bound_host.decode("utf-8", "replace")
+    print(f"nano_jev 服务已启动：http://{bound_host}:{bound_port}（版本 {VERSION}）", file=sys.stderr)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -192,7 +197,11 @@ def _run_label(args: argparse.Namespace) -> int:
 
 def _run_decide(args: argparse.Namespace) -> int:
     """``decide`` 子命令：读入一份 decisions 请求，输出响应 JSON。"""
-    raw = sys.stdin.read() if args.file == "-" else open(args.file, encoding="utf-8").read()
+    if args.file == "-":
+        raw = sys.stdin.read()
+    else:
+        with open(args.file, encoding="utf-8") as handle:
+            raw = handle.read()
     body = json.loads(raw)
     response = handle_decisions(body, parse_topics(args.topics))
     print(json.dumps(response, ensure_ascii=False, indent=2))
