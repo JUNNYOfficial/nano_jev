@@ -13,10 +13,13 @@ from __future__ import annotations
 import pathlib
 import sys
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+# 本文件位于 nano_jev/tests/ 下，故要往上三层才回到"能看到 nano_jev 包"的仓库父目录。
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from nano_jev.nj_engine import clamp, classify, estimate_tokens, longest_quote  # noqa: E402
+from nano_jev import nj_engine  # noqa: E402
+from nano_jev import nj_lexicon as lx  # noqa: E402
+from nano_jev.nj_engine import _count, clamp, classify, estimate_tokens, longest_quote  # noqa: E402
 from nano_jev.nj_vocab import MAX_ASPECTS, MAX_EMOTIONS  # noqa: E402
 
 
@@ -25,6 +28,42 @@ def test_classification_is_deterministic():
     first = classify("c0", "这个模型很好用，速度快，推荐！", topic_title="评测")
     second = classify("c0", "这个模型很好用，速度快，推荐！", topic_title="评测")
     assert first == second
+
+
+def test_classify_scans_each_lexicon_group_once(monkeypatch):
+    """回归：热路径不得重复扫描——每个词典组只该被扫一遍。
+
+    这是「快速决策」的结构性保证。旧实现把极性词条扫了两遍、主题词未命中时又在
+    相关性判断里把 opinion/aspect/intent 各重扫一遍，实际检查量会远超「每组一遍」
+    的上界。这里用 monkeypatch 统计真实词条检查量，断言不超过上界——纯计数、不依赖
+    计时，故不会在慢机器上抖动。
+    """
+    groups = [
+        lx.POSITIVE,
+        lx.STRONG_POSITIVE,
+        lx.NEGATIVE,
+        lx.STRONG_NEGATIVE,
+        lx.DEFAULT_TOPICS,
+        *lx.INTENT_CUES.values(),
+        *lx.ASPECT_CUES.values(),
+        *lx.EMOTION_CUES.values(),
+    ]
+    once = sum(len(group) for group in groups)
+
+    checked = {"terms": 0}
+    real_count = nj_engine._count
+
+    def counting(text: str, terms) -> int:
+        checked["terms"] += len(terms)
+        return real_count(text, terms)
+
+    monkeypatch.setattr(nj_engine, "_count", counting)
+
+    # 覆盖主题命中（提前返回）与不命中（走相关性 fallback，旧实现最慢）两条路径。
+    classify("c0", "这个模型回答准确，速度快，推荐")
+    classify("c1", "I waited for the rain and the failure was painful")
+
+    assert checked["terms"] <= once * 2, f"词条检查 {checked['terms']} 超出每组一遍的上界 {once * 2}"
 
 
 def test_positive_and_negative_polarity():
@@ -98,3 +137,59 @@ def test_custom_topics_change_relevance():
     text = "这款相机拍夜景很不错"
     assert classify("c0", text).is_relevant is False
     assert classify("c0", text, topics=("相机",)).is_relevant is True
+
+
+def test_ascii_terms_match_only_at_word_boundaries():
+    """回归：英文词条只认词边界，不再把 ``ai``/``app``/``bug`` 当成词内子串。"""
+    for text, term in [
+        ("the chairman said", "ai"),
+        ("i waited for the rain", "ai"),
+        ("an apple a day", "app"),
+        ("let us debug this", "bug"),
+        ("the build failed", "ui"),
+    ]:
+        assert _count(text, (term,)) == 0, f"{term!r} 不该命中 {text!r}"
+
+
+def test_ascii_terms_tolerate_inflections():
+    """回归：切词边界不能把 ``models``/``crashed``/``slower`` 这些真命中一起切掉。"""
+    for text, term in [
+        ("both models are good", "model"),
+        ("it crashed twice", "crash"),
+        ("it crashes a lot", "crash"),
+        ("the slower path", "slow"),
+        ("i recommended it", "recommend"),
+        ("i liked the answer", "like"),
+    ]:
+        assert _count(text, (term,)) == 1, f"{term!r} 应命中 {text!r}"
+
+
+def test_ascii_terms_allow_digit_suffix():
+    """``gpt4`` / ``llama3`` 这类带版本号的写法仍算命中，但 ``chatgpt`` 不算。"""
+    assert _count("gpt4 is fast", ("gpt",)) == 1
+    assert _count("llama3 rocks", ("llama",)) == 1
+    assert _count("not chatgpt", ("gpt",)) == 0
+
+
+def test_chinese_terms_keep_substring_matching():
+    """中文没有词边界，仍走子串匹配——这是刻意保留的代价，README 局限节已写明。"""
+    assert _count("这个模型很好", ("模型",)) == 1
+    assert _count("这是一张卡片", ("卡",)) == 1
+
+
+def test_custom_ascii_topics_also_use_word_boundaries():
+    """``--topics`` 传进来的自定义英文主题词也要切边界，不能漏回子串匹配。"""
+    assert classify("c0", "The chairman spoke", topics=("ai",)).is_relevant is False
+    assert classify("c0", "The AI model is good", topics=("ai",)).is_relevant is True
+
+
+def test_off_domain_english_is_not_relevant():
+    """回归：整条与主题无关的英文句子，不该因 ``ai``/``app`` 这类子串误命中被判相关。"""
+    for text in [
+        "The chairman said he will remain in charge",
+        "I waited for the rain and the failure was painful",
+        "An apple a day keeps the doctor away",
+        "Let's debug the legacy codebase tomorrow",
+        "The aisle was crowded with tourists",
+    ]:
+        assert classify("c0", text).is_relevant is False, text
