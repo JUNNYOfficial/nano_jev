@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  quality:
+    name: lint / types / tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 与 pyproject 的 requires-python >=3.9 及 classifiers 对齐；代码用了 3.9+ 的
+        # 语法（``dict[str, ...]`` 这类内建泛型），故不覆盖 3.8。
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package with dev tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: ruff
+        run: ruff check .
+
+      - name: mypy
+        run: mypy
+
+      # pytest 的 testpaths 配在包根目录，而「仓库名即包名、包根即仓库根」，
+      # 故在仓库根直接跑即可（测试位于 nano_jev/tests/）。
+      - name: pytest
+        run: pytest -q
+
+  build:
+    name: build wheel and check packaged contents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip "setuptools>=61" build
+          python -m build --wheel
+
+      # 守住两件容易悄悄回归的事：① 测试文件不得进 wheel；② py.typed 必须在。
+      - name: Assert wheel contents
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, wheels
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          leaked = [n for n in names if "/test_" in n or "/tests/" in n]
+          assert not leaked, f"测试文件被打进 wheel：{leaked}"
+          assert "nano_jev/py.typed" in names, f"wheel 缺少 py.typed：{names}"
+          print("wheel 内容 OK：", sorted(names))
+          PY
+
+  smoke:
+    name: install wheel and probe the live server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      # 从 wheel 装（而不是 -e），这样顺带验证「装完之后能当 Jev 平替用」。
+      - name: Build and install wheel
+        run: |
+          python -m pip install --upgrade pip "setuptools>=61" build
+          python -m build --wheel
+          python -m pip install dist/*.whl
+
+      - name: Serve and probe
+        run: |
+          NANO_JV_TOKEN=ci-token python -m nano_jev.nj_server serve --port 8765 &
+          for _ in $(seq 1 40); do
+            curl -sf http://127.0.0.1:8765/health >/dev/null && break
+            sleep 0.3
+          done
+          curl -sf http://127.0.0.1:8765/health
+          echo
+
+          # 回归：NANO_JV_TOKEN 必须真的开启鉴权。
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            http://127.0.0.1:8765/alpha/decisions -H 'Content-Type: application/json' -d '{}')
+          test "$code" = "401" || { echo "期望 401，实得 $code"; exit 1; }
+
+          # 回归：方法不对不得回 200 或 HTML 501。
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/alpha/decisions)
+          test "$code" = "405" || { echo "期望 405，实得 $code"; exit 1; }
+
+          # 带令牌 → 200，且真的给出答案。
+          curl -sf -X POST http://127.0.0.1:8765/alpha/decisions \
+            -H 'Content-Type: application/json' -H 'Authorization: Bearer ci-token' \
+            -d '{"model":"nano-jev","state":{"comments":[{"comment_id":"c0","content":"这个模型很准确，推荐"}]},"questions":{"c0_relevant":{"type":"noul","criteria":{"true":"是","false":"否"}}}}' \
+            | python -c "import json,sys; d=json.load(sys.stdin); assert d['answers']['c0_relevant']['noul'] > 0.5, d; print('decisions OK, cost =', d['usage']['cost'])"
+
+          # 回归：英文子串误命中（ai ⊂ chairman）不得再判成相关。
+          curl -sf -X POST http://127.0.0.1:8765/v1/chat/completions \
+            -H 'Content-Type: application/json' -H 'Authorization: Bearer ci-token' \
+            -d '{"model":"nano-jev","messages":[{"role":"user","content":"The chairman said he will remain in charge"}]}' \
+            | python -c "import json,sys; d=json.load(sys.stdin); lab=json.loads(d['choices'][0]['message']['content'])['labels'][0]; assert lab['is_relevant'] is False, lab; print('英文边界匹配 OK')"
+
+          echo "smoke 通过"

@@ -70,7 +70,13 @@ def _message_text(messages: object) -> str:
 
 
 def _find_comments_object(text: str) -> dict[str, object] | None:
-    """在任意文本里找出**最后一个**含 ``comments`` 数组的 JSON 对象。"""
+    """在任意文本里找出**最后一个**含 ``comments`` 数组的 JSON 对象。
+
+    对每个 ``{`` 都试一次 ``raw_decode``。曾试图改成从后往前扫并命中即返回，实测
+    在 jev-arena 形状的 payload 上**零收益**（43.1us → 42.9us）：目标对象是最外层
+    那个，下标最小，逆序反而要走过全部嵌套花括号才轮到它。该 payload 下整个函数只
+    占单次请求的极小头，故保留这个更好懂的版本。
+    """
     decoder = json.JSONDecoder()
     best: dict[str, object] | None = None
     index = text.find("{")

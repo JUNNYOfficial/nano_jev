@@ -42,9 +42,16 @@ nano-jev = "nano_jev.nj_server:main"
 Repository = "https://github.com/JUNNYOfficial/nano_jev"
 Issues = "https://github.com/JUNNYOfficial/nano_jev/issues"
 
+# 只把包本体打进 wheel。``tests/`` 刻意不在此列：仓库名即包名、``package-dir`` 又把
+# 仓库根映射成 ``nano_jev``，若不显式列举包，包根下的测试文件会被 build_py 一起收走。
+# CI 的 build 任务会断言 wheel 里不含测试文件，防止这条配置被改回去。
 [tool.setuptools]
 packages = ["nano_jev"]
 include-package-data = false
+
+# 空标记文件：声明本包自带类型注解，下游 mypy/pyright 可直接使用，无需另发 stub。
+[tool.setuptools.package-data]
+nano_jev = ["py.typed"]
 
 [tool.setuptools.package-dir]
 nano_jev = "."

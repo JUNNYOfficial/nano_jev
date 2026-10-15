@@ -12,7 +12,8 @@ import sys
 
 import pytest
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+# 本文件位于 nano_jev/tests/ 下，故要往上三层才回到"能看到 nano_jev 包"的仓库父目录。
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from nano_jev.nj_contract import (  # noqa: E402
@@ -23,6 +24,8 @@ from nano_jev.nj_contract import (  # noqa: E402
     label_comments,
     parse_decisions_request,
 )
+from nano_jev.nj_engine import estimate_tokens  # noqa: E402
+from nano_jev.nj_lexicon import DEFAULT_TOPICS as LEXICON_DEFAULT_TOPICS  # noqa: E402
 from nano_jev.nj_vocab import (  # noqa: E402
     ASPECTS,
     EMOTIONS,
@@ -69,6 +72,25 @@ def _arena_request() -> dict:
             "c0_emotion_失望": {"type": "noul", "criteria": {"true": "是", "false": "否"}},
         },
     }
+
+
+def test_module_exports_are_complete():
+    """``__all__`` 必须逐项可取；``VERSION`` / ``DEFAULT_TOPICS`` 也在公开面内。"""
+    import nano_jev
+
+    for name in nano_jev.__all__:
+        assert hasattr(nano_jev, name), name
+    assert nano_jev.VERSION
+    assert tuple(LEXICON_DEFAULT_TOPICS) == nano_jev.DEFAULT_TOPICS
+
+
+def test_estimate_tokens_edge_cases():
+    """``estimate_tokens`` 改写为一次扫描后，边界与混排仍按老口径。"""
+    assert estimate_tokens("") == 0
+    assert estimate_tokens(None) == 2  # str(None) == "None"，4 字符 × 0.5 = 2.0
+    assert estimate_tokens("😀") == 1
+    assert estimate_tokens("ab") == 1
+    assert estimate_tokens("啊" * 100) == 105
 
 
 def test_vocab_matches_jev_arena():

@@ -44,9 +44,13 @@ python3 -m nano_jev.nj_server decide --file req.json
 **B. 安装成包**（`pyproject.toml` 已配好，装完多一个 `nano-jev` 命令）：
 
 ```bash
-pip install .                 # 或 pip install -e . 做可编辑安装
-nano-jev serve --port 8765    # 等价于 python -m nano_jev.nj_server
+pip install -U "setuptools>=61"   # [project] 表需要 setuptools>=61；过旧会静默装出空包
+pip install .                     # 或 pip install -e . 做可编辑安装
+nano-jev --version                # 确认装的是哪版
+nano-jev serve --port 8765        # 等价于 python -m nano_jev.nj_server
 ```
+
+装出来的 wheel 只含包本体（7 个模块 + `py.typed`），不含 `tests/`。
 
 
 ## 接进 jev-arena（两种方式）
@@ -88,6 +92,25 @@ export OPENROUTER_BASE_URL=http://127.0.0.1:8765   # 别再指向 openrouter.ai
 契约错误一律回 `{"error": {"message", "code"}}`（与 Jev 报错形状一致）。响应里的
 `usage.cost` 恒为 `0.0`——本地服务不产生供应商费用，`0` 是「免费」而非「未知」。
 
+错误码一并说明：
+
+| 状态 | 何时 |
+| --- | --- |
+| 400 | 请求体非法 JSON；`Content-Length` 非整数或为负 |
+| 401 | 设了令牌而 `Authorization` 不匹配 |
+| 404 | 未知路径 |
+| 405 | 已知路径但方法不对；响应带 `Allow` 头。**不再**落到 Python 默认的 HTML 501 |
+| 413 | 请求体超过 32 MiB |
+| 500 | 内部错误；详情只进服务端 stderr，对外回泛化文案，不泄露异常原文 |
+
+`OPTIONS` 回 204 + `Allow`，便于客户端探测可用方法。
+
+请求体按 `Content-Length` 读入，长度非法（非整数/负数）回 400、超过 32 MiB 回 413；
+这两种情况都没有读走请求体，故响应会带 `Connection: close` 主动断开，避免残留字节
+污染同一条 keep-alive 连接的下一个请求。分块编码的流式响应无论正常结束还是中途失败
+都会写出终止块，不会让客户端一直等下去。绑到非回环地址（如 `--host 0.0.0.0`）而又
+没设令牌时，启动会往 stderr 打一条警告——否则等于静默把无鉴权服务开到局域网。
+
 ## 命令行
 
 ```bash
@@ -95,10 +118,18 @@ python -m nano_jev.nj_server serve [--host 127.0.0.1] [--port 8765]
                                    [--topics 模型,产品] [--token <可选访问令牌>]
 python -m nano_jev.nj_server label "一段文本" [--id c0] [--stdin] [--topics ...]
 python -m nano_jev.nj_server decide [--file req.json] [--topics ...]
+python -m nano_jev.nj_server --version
 ```
+
+`label` 的位置参数与 `--stdin` 只能给一个，两个都给会报错退出（退出码 2），不再静默
+以 stdin 为准。
 
 `--topics`（或环境变量 `NANO_JV_TOPICS`）用于换掉「相关性」判据的主题词表，把粗筛
 搬到别的评论域（默认是 AI 模型/产品）。
+
+`--token`（或环境变量 `NANO_JV_TOKEN`）用于开启鉴权：设了之后所有请求须带
+`Authorization: Bearer <token>`，不匹配回 401；两者都不给则不鉴权（本地使用）。
+命令行参数优先于环境变量。
 
 ## 模块一览
 
@@ -110,6 +141,7 @@ python -m nano_jev.nj_server decide [--file req.json] [--topics ...]
 | `nj_contract.py` | Jev `/alpha/decisions` 契约的解析与响应构造 |
 | `nj_openai.py` | OpenAI `/chat/completions` 适配层（含流式 SSE） |
 | `nj_server.py` | 零依赖 HTTP 服务与命令行入口 |
+| `tests/` | pytest 测试：纯函数层 + 真起服务的 HTTP 层 |
 | `pyproject.toml` | 打包元数据 + pytest / ruff / mypy 配置 |
 
 ## 架构与数据流
@@ -188,7 +220,8 @@ flowchart TD
 
 ## 测试
 
-测试就在本包内（`test_nj_*.py`）。与运行服务一样，在 `nano_jev/` 的**父目录**执行：
+测试放在 `nano_jev/tests/`（**不是**包根：包根即仓库根，测试留在那里会被
+setuptools 一起打进 wheel）。与运行服务一样，在 `nano_jev/` 的**父目录**执行：
 
 ```bash
 python3 -m pytest nano_jev/ -q
@@ -198,8 +231,9 @@ python3 -m pytest nano_jev/ -q
 真发 HTTP**：
 
 ```bash
-python3 -m pytest nano_jev/test_nj_engine.py nano_jev/test_nj_contract.py nano_jev/test_nj_openai.py -q
-python3 -m pytest nano_jev/test_nj_server.py -q
+python3 -m pytest nano_jev/tests/test_nj_engine.py nano_jev/tests/test_nj_contract.py \
+                nano_jev/tests/test_nj_openai.py -q
+python3 -m pytest nano_jev/tests/test_nj_server.py -q
 ```
 
 安装后也可直接 `pytest`（配置见 `pyproject.toml`）。
@@ -216,11 +250,20 @@ mypy                        # 类型检查（无第三方依赖，近乎零噪�
 pytest                      # 单元 + 端到端（真起服务的 HTTP 测试）
 ```
 
+`.github/workflows/ci.yml` 在每次 push / PR 上跑同一套（3.9–3.13 矩阵），另加两个
+守门任务：**构建 wheel 并断言包内容**（测试文件不得进 wheel、`py.typed` 必须在）、
+**从 wheel 安装后真起服务打一轮 HTTP**（鉴权 401、方法 405、decisions 出答案）。
+
 ## 局限（如实写清）
 
 1. **判据是词典，不是理解**：反讽、长句、隐含语义、词典未覆盖的新词都会判错。
-2. **子串匹配会有误命中**：「好」会命中「好久不见」，「卡」会命中「卡片」——对粗筛
-   可接受，不可当精选结论。
-3. **中文优先、英文次之**：词典以北向中文为主，英文线索较粗。
-4. **词表如需与上游保持同步**：jev-arena 改 `vocab.mjs` 时要同步改 `nj_vocab.py`，
-   否则 `test_nj_contract.py::test_vocab_matches_jev_arena` 应报红。
+2. **中文子串匹配会有误命中**：「好」会命中「好久不见」，「卡」会命中「卡片」。中文
+   没有词边界、本子系统又不引入分词依赖，这条代价是**刻意留下**的——对粗筛可接受，
+   不可当精选结论。
+3. **中文优先、英文次之**：词典以中文为主，英文线索较粗。
+4. **英文按词边界匹配，但屈折覆盖有限**：纯 ASCII 词条按英文词边界匹配（`ai` 不再
+   命中 `chairman`／`rain`，`app` 不再命中 `apple`），并容忍 `models` / `crashed` /
+   `slower` 这类常见屈折；但 `like`→`liking` 这种去 e 加 ing 的不规则形式、以及词典
+   未收录的新缩写仍会漏。
+5. **词表如需与上游保持同步**：jev-arena 改 `vocab.mjs` 时要同步改 `nj_vocab.py`，
+   否则 `tests/test_nj_contract.py::test_vocab_matches_jev_arena` 应报红。

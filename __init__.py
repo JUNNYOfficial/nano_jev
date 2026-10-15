@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 from .nj_contract import (
+    DEFAULT_TOPICS,
     DecisionsRequest,
     build_answers,
     build_decisions_response,
@@ -38,11 +39,13 @@ from .nj_vocab import ASPECTS, EMOTIONS, INTENTS, MAX_ASPECTS, MAX_EMOTIONS, SEN
 
 __all__ = [
     "ASPECTS",
+    "DEFAULT_TOPICS",
     "EMOTIONS",
     "INTENTS",
     "MAX_ASPECTS",
     "MAX_EMOTIONS",
     "SENTIMENTS",
+    "VERSION",
     "DecisionsRequest",
     "Label",
     "build_answers",

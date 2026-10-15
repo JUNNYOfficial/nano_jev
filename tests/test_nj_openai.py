@@ -10,7 +10,8 @@ import json
 import pathlib
 import sys
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+# 本文件位于 nano_jev/tests/ 下，故要往上三层才回到"能看到 nano_jev 包"的仓库父目录。
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from nano_jev import nj_openai  # noqa: E402
