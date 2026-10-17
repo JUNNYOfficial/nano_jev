@@ -7,6 +7,7 @@ jev-arena 指着用"这件事才算被端到端验证过（契约测试只测了
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import pathlib
@@ -796,3 +797,90 @@ def test_health_reports_metrics(server_url: str, hybrid_reset: None):
     assert metrics["labels"] == 2
     assert metrics["escalated"] == 1
     assert metrics["llm_errors"] == 0
+
+
+def test_concurrency_limit_returns_429_with_retry_after(
+    server_url: str, hybrid_reset: None
+):
+    """并发槽占满时立即回 429，而不是排队把线程堆住。"""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_judge(_content: str, hint: Any) -> Any:
+        entered.set()
+        release.wait(5)
+        return Label(hint.comment_id, True, "positive", 0.9, 0.9, "praise")
+
+    nj_server.configure_hybrid(
+        slow_judge,
+        limits=nj_server.ServiceLimits(max_concurrent=1, retry_after_s=2),
+    )
+    body = {
+        "model": "nano-jev",
+        "state": {"comments": [{"comment_id": "c0", "content": "这个模型还行"}]},
+        "questions": {"c0_sentiment": {"type": "choice", "criteria": {}}},
+    }
+
+    def first() -> None:
+        with contextlib.suppress(urllib.error.HTTPError):
+            _post(server_url + "/alpha/decisions", body)
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    assert entered.wait(5)
+
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(server_url + "/alpha/decisions", body)
+    assert excinfo.value.code == 429
+    assert excinfo.value.headers.get("Retry-After") == "2"
+
+    release.set()
+    thread.join(5)
+    limits = _get(server_url + "/health")[1]["limits"]
+    assert limits["rejected"] >= 1
+    assert limits["in_flight"] == 0
+
+
+def test_per_client_budget_uses_client_header(server_url: str, hybrid_reset: None):
+    def judge(_content: str, hint: Any) -> Any:
+        return Label(hint.comment_id, True, "positive", 0.9, 0.9, "praise")
+
+    nj_server.configure_hybrid(
+        judge, limits=nj_server.ServiceLimits(per_client_budget=1)
+    )
+    body = {
+        "model": "nano-jev",
+        "state": {"comments": [{"comment_id": "c0", "content": "这个模型还行"}]},
+        "questions": {"c0_sentiment": {"type": "choice", "criteria": {}}},
+    }
+
+    def post_as(client: str) -> int:
+        data = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            server_url + "/alpha/decisions",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "X-Client-Id": client,
+            },
+            method="POST",
+        )
+        try:
+            with _OPENER.open(request, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    assert post_as("alice") == 200
+    assert post_as("bob") == 200
+    assert post_as("alice") == 429
+    assert post_as("bob") == 429
+
+
+def test_health_omits_limits_when_unlimited(server_url: str, hybrid_reset: None):
+    def judge(_content: str, hint: Any) -> Any:
+        return Label(hint.comment_id, True, "positive", 0.9, 0.9, "praise")
+
+    nj_server.configure_hybrid(judge)
+
+    assert "limits" not in _get(server_url + "/health")[1]

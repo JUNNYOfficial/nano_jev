@@ -55,6 +55,7 @@ from .nj_hybrid import (
     judge_hybrid,
     judge_many,
 )
+from .nj_limits import LimitExceededError, ServiceLimits
 from .nj_llm import OpenAICompatJudge, label_from_mapping
 from .nj_vocab import ASPECTS, EMOTIONS, INTENTS, MAX_ASPECTS, MAX_EMOTIONS, SENTIMENTS
 
@@ -77,10 +78,12 @@ __all__ = [
     "HybridResult",
     "LLMJudge",
     "Label",
+    "LimitExceededError",
     "OpenAICompatJudge",
     "PiiMatch",
     "PreparedContent",
     "PromptInjectionError",
+    "ServiceLimits",
     "build_answers",
     "build_decisions_response",
     "classify",

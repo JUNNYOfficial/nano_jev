@@ -52,7 +52,7 @@ nano-jev --version                # 确认装的是哪版
 nano-jev serve --port 8765        # 等价于 python -m nano_jev.nj_server
 ```
 
-装出来的 wheel 只含包本体（12 个模块 + `py.typed`），不含 `tests/`。
+装出来的 wheel 只含包本体（13 个模块 + `py.typed`），不含 `tests/`。
 
 
 ## 接进 jev-arena（两种方式）
@@ -215,9 +215,26 @@ python3 -m nano_jev.nj_server serve \
 * 错误语义：输入触发注入且策略为 `raise` → **400**；升级配额耗尽 → **429**；
   模型返回不合契约 → **502**；其余内部错误 → 500。
 * `/health` 的 `metrics` 给出判断条数、升级条数与模型错误数。
+* 限流：`--max-concurrent`（同时在飞的模型调用）、`--budget`（全局升级配额）、
+  `--per-client-budget`（按 `X-Client-Id` 或来源地址）；超限立即回 429 +
+  `Retry-After`，不排队。`/health` 的 `limits` 给出占用、用量与拒绝数。
 
 库内装配见 [`examples/llm_judge_openai.py`](examples/llm_judge_openai.py)：
 `OpenAICompatJudge` 只用标准库 `urllib`，可直接传给 `judge_hybrid`。
+
+## 评测：阈值扫描与防护收益
+
+```bash
+# 扫描多个置信度门槛，只跑 hybrid / brain
+.venv/bin/python scripts/eval_hybrid.py --sweep 0.3,0.5,0.65,0.8,0.9
+
+# 同时启用输入防护（block 命中注入时不升级）
+.venv/bin/python scripts/eval_hybrid.py --guard block
+```
+
+扫描结果按 `mode@阈值` 输出，便于直接看"多花的调用换来多少准确率"。
+示例数据上，控制器路由（brain）在 0.3–0.9 的阈值区间里升级率稳定在 30%，
+而固定阈值从 20% 一路涨到 100%——这正是把路由交给价值/证据机制的收益。
 
 ## HTTP 接口
 
@@ -262,6 +279,8 @@ python -m nano_jev.nj_server serve [--host 127.0.0.1] [--port 8765]
                                    [--hybrid-guard off|flag|block|raise]
                                    [--hybrid-cache-namespace NS] [--hybrid-cache-size N]
                                    [--hybrid-cache-ttl SECONDS]
+                                   [--max-concurrent N] [--budget N]
+                                   [--per-client-budget N] [--retry-after SECONDS]
 python -m nano_jev.nj_server label "一段文本" [--id c0] [--stdin] [--topics ...]
 python -m nano_jev.nj_server decide [--file req.json] [--topics ...]
 python -m nano_jev.nj_server --version
@@ -289,6 +308,7 @@ python -m nano_jev.nj_server --version
 | `nj_arbitrate.py` | 字段级升级与冲突仲裁 |
 | `nj_cache.py` | 线程安全的 LRU 缓存（命名空间 + TTL） |
 | `nj_llm.py` | OpenAI 兼容判断器（标准库 urllib）与标签构造 |
+| `nj_limits.py` | 服务限流：并发槽、全局配额、按客户端配额 |
 | `examples/` | 供应商适配示例（不随 wheel 分发） |
 | `nj_contract.py` | Jev `/alpha/decisions` 契约的解析与响应构造 |
 | `nj_openai.py` | OpenAI `/chat/completions` 适配层（含流式 SSE） |

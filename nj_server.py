@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import hmac
 import json
 import os
 import sys
 import traceback
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
@@ -34,6 +35,7 @@ from .nj_contract import DEFAULT_TOPICS, handle_decisions
 from .nj_engine import Labeler, classify
 from .nj_guard import GuardPolicy, PromptInjectionError
 from .nj_hybrid import BudgetExceededError, HybridPolicy
+from .nj_limits import LimitExceededError, ServiceLimits
 from .nj_llm import OpenAICompatJudge, make_hybrid_labeler
 from .nj_openai import handle_chat, handle_chat_stream, wants_stream
 
@@ -60,6 +62,12 @@ _cache: HybridCache = HybridCache(namespace="")
 
 #: 级联运行计数：判断条数、升级条数、模型/契约错误数。
 _metrics: dict[str, int] = {"labels": 0, "escalated": 0, "llm_errors": 0}
+
+#: 当前请求的客户端标识（头部 ``X-Client-Id``，缺省用来源地址）。
+_client: contextvars.ContextVar[str] = contextvars.ContextVar("nano_jev_client", default="")
+
+#: 服务级限流；``None`` 表示不限。
+_limits: ServiceLimits | None = None
 
 #: 对外暴露的模型对象（OpenAI 风格），``/v1/models`` 与其子路径共用。
 _MODEL: dict[str, Any] = {"id": "nano-jev", "object": "model", "owned_by": "nano_jev"}
@@ -110,6 +118,7 @@ def configure_hybrid(
     cache_size: int = 1024,
     cache_ttl_s: float | None = None,
     topics: Sequence[str] | None = None,
+    limits: ServiceLimits | None = None,
 ) -> HybridCache:
     """启用/关闭服务的级联后端；返回生效的缓存句柄。
 
@@ -118,9 +127,12 @@ def configure_hybrid(
 
     缓存默认关闭：``cache_namespace`` 留空即不缓存。开启时请用
     ``"<模型 id>/<提示词版本>"`` 作为命名空间，避免换模型后读到旧结论。
+
+    ``limits`` 约束并发与配额；超限时抛 :class:`LimitExceededError`，服务层回 429。
     """
-    global _labeler, _cache
+    global _labeler, _cache, _limits
     _metrics.update(labels=0, escalated=0, llm_errors=0)
+    _limits = limits
     if judge is None:
         _labeler = None
         _cache = HybridCache(namespace="")
@@ -129,8 +141,9 @@ def configure_hybrid(
     _cache = HybridCache(
         namespace=cache_namespace, maxsize=cache_size, ttl_s=cache_ttl_s
     )
+    guarded = _limit_guard(judge, limits) if limits is not None else judge
     _labeler = make_hybrid_labeler(
-        judge,
+        guarded,
         policy=policy if policy is not None else HybridPolicy(),
         guard=guard,
         cache=_cache if _cache.enabled else None,
@@ -138,6 +151,25 @@ def configure_hybrid(
         on_result=_record_result,
     )
     return _cache
+
+
+def _limit_guard(judge: Any, limits: ServiceLimits) -> Callable[[str, Any], Any]:
+    """给模型回调套上并发槽与配额；只有真正升级的样本会走到这里。"""
+
+    def guarded(content: str, nano_label: Any, /) -> Any:
+        with limits.model_call(_client.get()):
+            return judge(content, nano_label)
+
+    return guarded
+
+
+def _client_key(handler: Any) -> str:
+    """客户端标识：显式头部优先，其次来源地址（IPv6 也按原样保留）。"""
+    header = handler.headers.get("X-Client-Id")
+    if header and header.strip():
+        return header.strip()[:64]
+    address = handler.client_address[0] if handler.client_address else ""
+    return str(address)
 
 
 def _record_result(result: Any) -> None:
@@ -151,11 +183,14 @@ def _record_result(result: Any) -> None:
 
 def hybrid_status() -> dict[str, object]:
     """级联后端的只读状态，供 ``/health`` 与排障使用。"""
-    return {
+    status: dict[str, object] = {
         "hybrid": _labeler is not None,
         "cache": _cache.stats(),
         "metrics": dict(_metrics),
     }
+    if _limits is not None:
+        status["limits"] = _limits.snapshot()
+    return status
 
 
 def apply_config(topics: Sequence[str] | None = None, token: str | None = None) -> None:
@@ -407,6 +442,7 @@ class _Handler(BaseHTTPRequestHandler):
         path = self._path()
         payload: Any = None
         stream_chunks: Iterable[str] | None = None
+        token = _client.set(_client_key(self))
         try:
             if path.endswith("/alpha/decisions"):
                 payload = handle_decisions(body, _topics, _labeler)
@@ -423,6 +459,15 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._send_error_json(f"未知路径：{path}", 404, 404)
                 return
+        except LimitExceededError as exc:
+            # 并发或配额超限：明确回 429 并给 Retry-After，调用方才知道该退避。
+            self._send_error_json(
+                f"服务限流（{exc.reason}）",
+                429,
+                429,
+                headers=[("Retry-After", f"{exc.retry_after_s:g}")],
+            )
+            return
         except PromptInjectionError as exc:
             # 输入命中注入模式且策略为 raise：这是**客户端**的输入问题，不是服务故障。
             # 之前落到通用 Exception 分支回 500，会让调用方误以为是服务端 bug 并重试。
@@ -443,6 +488,8 @@ class _Handler(BaseHTTPRequestHandler):
             traceback.print_exc(file=sys.stderr)
             self._send_error_json("内部错误，详见服务端日志", 500, 500)
             return
+        finally:
+            _client.reset(token)
         if stream_chunks is not None:
             self._send_event_stream(stream_chunks)
             return
@@ -545,6 +592,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--hybrid-timeout", type=float, default=60.0, help="单次模型调用超时秒数"
     )
     serve_parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=0,
+        help="同时在飞的模型调用上限；0 表示不限，超出回 429",
+    )
+    serve_parser.add_argument(
+        "--budget", type=int, default=None, help="整台机器的升级总配额；默认不限"
+    )
+    serve_parser.add_argument(
+        "--per-client-budget",
+        type=int,
+        default=None,
+        help="单个客户端（X-Client-Id 或来源地址）的升级配额；默认不限",
+    )
+    serve_parser.add_argument(
+        "--retry-after",
+        type=float,
+        default=1.0,
+        help="触发限流时返回的 Retry-After 秒数",
+    )
+    serve_parser.add_argument(
         "--hybrid-guard",
         choices=("off", "flag", "block", "raise"),
         default="flag",
@@ -589,6 +657,14 @@ def _configure_hybrid_from_args(args: argparse.Namespace) -> None:
     guard = None if args.hybrid_guard == "off" else GuardPolicy(
         injection_action=args.hybrid_guard
     )
+    limits = None
+    if args.max_concurrent or args.budget is not None or args.per_client_budget is not None:
+        limits = ServiceLimits(
+            max_concurrent=args.max_concurrent,
+            global_budget=args.budget,
+            per_client_budget=args.per_client_budget,
+            retry_after_s=args.retry_after,
+        )
     configure_hybrid(
         OpenAICompatJudge(
             endpoint=endpoint, model=model, api_key=api_key, timeout=args.hybrid_timeout
@@ -599,6 +675,7 @@ def _configure_hybrid_from_args(args: argparse.Namespace) -> None:
         cache_size=args.hybrid_cache_size,
         cache_ttl_s=args.hybrid_cache_ttl,
         topics=parse_topics(args.topics),
+        limits=limits,
     )
 
 

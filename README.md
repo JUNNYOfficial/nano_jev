@@ -56,7 +56,7 @@ nano-jev --version                # confirm which version is installed
 nano-jev serve --port 8765        # equivalent to python -m nano_jev.nj_server
 ```
 
-The wheel ships only the package body (12 modules + `py.typed`), not `tests/`.
+The wheel ships only the package body (13 modules + `py.typed`), not `tests/`.
 
 
 ## Wiring into jev-arena (two ways)
@@ -232,9 +232,26 @@ python3 -m nano_jev.nj_server serve \
 * Error semantics: injection blocked under `raise` → **400**; escalation budget
   exhausted → **429**; model output violating the contract → **502**; anything else → 500.
 * `/health` exposes `metrics` with label count, escalation count, and model errors.
+* Rate limits: `--max-concurrent` (in-flight model calls), `--budget` (global escalation
+  quota), `--per-client-budget` (by `X-Client-Id` or source address). Over-limit requests
+  get an immediate 429 + `Retry-After` instead of queueing; `/health` reports `limits`.
 
 See [`examples/llm_judge_openai.py`](examples/llm_judge_openai.py) for library wiring:
 `OpenAICompatJudge` uses only stdlib `urllib` and plugs straight into `judge_hybrid`.
+
+## Evaluation: threshold sweep and guard impact
+
+```bash
+# Sweep confidence thresholds; runs hybrid / brain only
+.venv/bin/python scripts/eval_hybrid.py --sweep 0.3,0.5,0.65,0.8,0.9
+
+# Enable the input guard too (block: injected samples are not escalated)
+.venv/bin/python scripts/eval_hybrid.py --guard block
+```
+
+Rows are labelled `mode@threshold`, so you can read the trade-off directly. On the sample
+dataset the controller route (brain) stays at a 30% escalation rate across 0.3–0.9, while
+the fixed threshold climbs from 20% to 100% — the payoff of routing by evidence and value.
 
 ## HTTP API
 
@@ -283,6 +300,8 @@ python -m nano_jev.nj_server serve [--host 127.0.0.1] [--port 8765]
                                    [--hybrid-guard off|flag|block|raise]
                                    [--hybrid-cache-namespace NS] [--hybrid-cache-size N]
                                    [--hybrid-cache-ttl SECONDS]
+                                   [--max-concurrent N] [--budget N]
+                                   [--per-client-budget N] [--retry-after SECONDS]
 python -m nano_jev.nj_server label "一段文本" [--id c0] [--stdin] [--topics ...]
 python -m nano_jev.nj_server decide [--file req.json] [--topics ...]
 python -m nano_jev.nj_server --version
@@ -312,6 +331,7 @@ precedence over environment variables.
 | `nj_arbitrate.py` | Field-level escalation and conflict arbitration |
 | `nj_cache.py` | Thread-safe LRU cache (namespace + TTL) |
 | `nj_llm.py` | OpenAI-compatible judge (stdlib urllib) and label construction |
+| `nj_limits.py` | Serving limits: concurrency slots, global and per-client quotas |
 | `examples/` | Vendor adapter example (not shipped in the wheel) |
 | `nj_contract.py` | Parsing and response construction for the Jev `/alpha/decisions` contract |
 | `nj_openai.py` | OpenAI `/chat/completions` adapter layer (including streaming SSE) |
