@@ -22,11 +22,11 @@ from nano_jev.nj_llm import (  # noqa: E402
 
 
 class _FakeResponse(io.BytesIO):
-    def __enter__(self):
+    def __enter__(self) -> _FakeResponse:
         return self
 
-    def __exit__(self, *exc):
-        return False
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 def _fake_urlopen(payload, captured):

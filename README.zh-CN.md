@@ -52,7 +52,7 @@ nano-jev --version                # 确认装的是哪版
 nano-jev serve --port 8765        # 等价于 python -m nano_jev.nj_server
 ```
 
-装出来的 wheel 只含包本体（13 个模块 + `py.typed`），不含 `tests/`。
+装出来的 wheel 只含包本体（14 个模块 + `py.typed`），不含 `tests/`。
 
 
 ## 接进 jev-arena（两种方式）
@@ -154,9 +154,46 @@ result = judge_hybrid(
 | 能力 | 行为 |
 | --- | --- |
 | PII 脱敏 | 邮箱、手机号、身份证、银行卡与常见密钥替换成 `[EMAIL]` 等占位符，模型看到的是脱敏文本 |
+| 校验位过滤 | 身份证按 GB 11643-1999 校验位、银行卡按 Luhn 校验；**校验不过的数字段保持原样** |
+| 号码精度 | 手机号限大陆 `1[3-9]` + 可选 `86` 前缀；国际号码必须有显式 `+`；固话必须有区号连字符 |
 | 截断 | `max_chars > 0` 时截断，并在结果里标记 `truncated` |
 | 注入检测 | 命中"忽略以上指令 / 输出系统提示词"等中英模式；`flag` 只记录、`block` 不升级、`raise` 抛 `PromptInjectionError` |
 | 包裹 | 送进模型的文本用 `<content>` 定界，定界符会被转义 |
+| 可配置 | `pii_kinds` 选择内置规则；`extra_rules` 追加 `CustomRule`（正则 + 可选校验函数） |
+
+校验位带来的收益是**少误伤**：`2024010112345678`（订单号）、`1700000000`（时间戳）、
+校验位错误的身份证号都不会被当成 PII 替换掉。代价是**会漏**：真实但校验位错误的
+数据、没有 `+` 的国际号码不会被识别。对"先脱敏再送模型"这个用途，漏比错改安全。
+
+```python
+from nano_jev import CustomRule, GuardPolicy
+import re
+
+policy = GuardPolicy(
+    pii_kinds=("email", "phone", "id_number"),   # 只要这三类
+    extra_rules=(                                 # 追加合作方会员号
+        CustomRule("member", re.compile(r"M\d{8}"), "[MEMBER]",
+                   validator=lambda v: v.endswith("7")),
+    ),
+)
+```
+
+### 标签契约校验
+
+`nj_validate` 回答"这份标签合不合契约"，与 `judge_hybrid` 的归一化分工不同：
+归一化用于运行时（尽量收敛让请求继续），校验用于**边界**（入口、数据集、跨服务
+响应），**只报问题、不改数据**。
+
+```python
+from nano_jev import validate_label, validate_label_mapping
+
+issues = validate_label(label, source_text=原始文本, strict_quote=True)
+issues = validate_label_mapping(raw_dict)      # 原始字典，不经过归一化
+```
+
+校验项：枚举是否在词表内、分数是否有限且在区间内、维度/情绪是否重复或超限、
+`is_relevant` 是否布尔、引文是否为原文逐字子串、`meta` 是否为映射。
+`require_valid_label` 在不合法时抛 `ValueError` 并列出全部问题。
 
 命中与处理记录写在 `label.meta["hybrid"]["guard"]`。**它不是安全边界**：只能挡已知
 措辞；真正的防线仍是"模型输出回到受控词表与原文校验"，以及不要把模型输出直接执行。
@@ -309,6 +346,7 @@ python -m nano_jev.nj_server --version
 | `nj_cache.py` | 线程安全的 LRU 缓存（命名空间 + TTL） |
 | `nj_llm.py` | OpenAI 兼容判断器（标准库 urllib）与标签构造 |
 | `nj_limits.py` | 服务限流：并发槽、全局配额、按客户端配额 |
+| `nj_validate.py` | 标签契约校验（原始字典与 `Label` 对象） |
 | `examples/` | 供应商适配示例（不随 wheel 分发） |
 | `nj_contract.py` | Jev `/alpha/decisions` 契约的解析与响应构造 |
 | `nj_openai.py` | OpenAI `/chat/completions` 适配层（含流式 SSE） |

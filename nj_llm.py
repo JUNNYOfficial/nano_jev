@@ -167,6 +167,7 @@ class OpenAICompatJudge:
         payload.update(self.extra_body)
         data = json.dumps(payload).encode("utf-8")
         started = perf_counter()
+        body: dict[str, Any] | None = None
         for attempt in range(self.retries + 1):
             request = urllib.request.Request(
                 self.endpoint.rstrip("/") + "/chat/completions",
@@ -187,6 +188,10 @@ class OpenAICompatJudge:
                     raise
                 time.sleep(self._retry_delay(exc, attempt))
         self.last_duration_ms = (perf_counter() - started) * 1000.0
+
+        # 循环至少执行一次，正常路径必然写入 body；这里只是给类型检查器兜底。
+        if body is None:  # pragma: no cover
+            raise RuntimeError("request loop exited without a response body")
 
         message = body["choices"][0]["message"]["content"]
         usage = body.get("usage")

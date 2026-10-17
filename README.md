@@ -56,7 +56,7 @@ nano-jev --version                # confirm which version is installed
 nano-jev serve --port 8765        # equivalent to python -m nano_jev.nj_server
 ```
 
-The wheel ships only the package body (13 modules + `py.typed`), not `tests/`.
+The wheel ships only the package body (14 modules + `py.typed`), not `tests/`.
 
 
 ## Wiring into jev-arena (two ways)
@@ -167,9 +167,49 @@ result = judge_hybrid(
 | Capability | Behavior |
 | --- | --- |
 | PII redaction | Emails, phone numbers, national IDs, bank cards, and common API keys become `[EMAIL]`-style placeholders before the model sees them |
+| Checksum filtering | Chinese IDs are validated per GB 11643-1999, bank cards by Luhn; **numbers that fail validation are left untouched** |
+| Number precision | Mainland mobiles only (`1[3-9]`, optional `86`); international numbers require an explicit `+`; landlines require an area-code separator |
 | Truncation | With `max_chars > 0`, the text is truncated and flagged as `truncated` |
 | Injection detection | Matches "ignore previous instructions", "reveal your system prompt", and Chinese equivalents; `flag` records, `block` skips escalation, `raise` raises `PromptInjectionError` |
 | Wrapping | Content is wrapped in a `<content>` block with delimiters escaped |
+| Configurable | `pii_kinds` selects built-in rules; `extra_rules` adds `CustomRule` (regex + optional validator) |
+
+Checksums buy **fewer false positives**: `2024010112345678` (an order id),
+`1700000000` (a timestamp), and IDs with a bad check digit are no longer redacted.
+The cost is **misses**: real data with a wrong check digit or an international number
+without `+` is not detected. For "redact before sending to a model", a miss is safer
+than corrupting the text.
+
+```python
+from nano_jev import CustomRule, GuardPolicy
+import re
+
+policy = GuardPolicy(
+    pii_kinds=("email", "phone", "id_number"),
+    extra_rules=(
+        CustomRule("member", re.compile(r"M\d{8}"), "[MEMBER]",
+                   validator=lambda v: v.endswith("7")),
+    ),
+)
+```
+
+### Label contract validation
+
+`nj_validate` answers "is this label valid?", which is deliberately separate from
+normalization: normalization runs at request time (converge and continue), validation
+runs at **boundaries** (ingress, datasets, cross-service responses) and **never rewrites
+data**.
+
+```python
+from nano_jev import validate_label, validate_label_mapping
+
+issues = validate_label(label, source_text=original_text, strict_quote=True)
+issues = validate_label_mapping(raw_dict)      # raw dict, no normalization
+```
+
+It checks enum membership, finite in-range scores, duplicate or excess aspects/emotions,
+`is_relevant` being a bool, the quote being a verbatim substring, and `meta` being a
+mapping. `require_valid_label` raises `ValueError` listing every problem.
 
 Findings are recorded under `label.meta["hybrid"]["guard"]`. This is **not a security
 boundary**: it only catches known phrasing. The real defenses remain controlled-vocabulary
@@ -332,6 +372,7 @@ precedence over environment variables.
 | `nj_cache.py` | Thread-safe LRU cache (namespace + TTL) |
 | `nj_llm.py` | OpenAI-compatible judge (stdlib urllib) and label construction |
 | `nj_limits.py` | Serving limits: concurrency slots, global and per-client quotas |
+| `nj_validate.py` | Label contract validation (raw dicts and `Label` objects) |
 | `examples/` | Vendor adapter example (not shipped in the wheel) |
 | `nj_contract.py` | Parsing and response construction for the Jev `/alpha/decisions` contract |
 | `nj_openai.py` | OpenAI `/chat/completions` adapter layer (including streaming SSE) |

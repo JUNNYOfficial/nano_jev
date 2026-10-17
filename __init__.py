@@ -57,6 +57,13 @@ from .nj_hybrid import (
 )
 from .nj_limits import LimitExceededError, ServiceLimits
 from .nj_llm import OpenAICompatJudge, label_from_mapping
+from .nj_validate import (
+    LabelIssue,
+    is_valid_label,
+    require_valid_label,
+    validate_label,
+    validate_label_mapping,
+)
 from .nj_vocab import ASPECTS, EMOTIONS, INTENTS, MAX_ASPECTS, MAX_EMOTIONS, SENTIMENTS
 
 __all__ = [
@@ -78,6 +85,7 @@ __all__ = [
     "HybridResult",
     "LLMJudge",
     "Label",
+    "LabelIssue",
     "LimitExceededError",
     "OpenAICompatJudge",
     "PiiMatch",
@@ -90,12 +98,16 @@ __all__ = [
     "detect_injection",
     "estimate_tokens",
     "field_agreement",
+    "is_valid_label",
     "judge_hybrid",
     "judge_many",
     "label_from_mapping",
     "merge_labels",
     "parse_decisions_request",
     "redact_pii",
+    "require_valid_label",
+    "validate_label",
+    "validate_label_mapping",
     "wrap_untrusted",
 ]
 

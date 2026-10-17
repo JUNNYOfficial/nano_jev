@@ -18,36 +18,95 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
-#: PII 规则：(类型, 预编译模式, 替换标记)。
-#: 顺序即替换顺序；长模式（密钥/身份证）放在手机号之前，避免被更短的规则先切碎。
-_PII_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+#: 中国居民身份证的加权因子与校验码表（GB 11643-1999）。
+_ID_WEIGHTS = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+_ID_CHECKSUM = "10X98765432"
+
+
+def luhn_valid(number: str) -> bool:
+    """Luhn 校验（银行卡/信用卡）。非数字或长度不在 12–19 之间一律为假。"""
+    digits = number.replace(" ", "").replace("-", "")
+    if not digits.isdigit() or not 12 <= len(digits) <= 19:
+        return False
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        value = int(char)
+        if index % 2 == 1:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
+
+
+def chinese_id_valid(number: str) -> bool:
+    """中国 18 位身份证校验位。前 17 位必须是数字，末位可为 X。"""
+    candidate = number.strip().upper()
+    if len(candidate) != 18 or not candidate[:17].isdigit():
+        return False
+    if candidate[17] not in "0123456789X":
+        return False
+    total = sum(int(char) * weight for char, weight in zip(candidate[:17], _ID_WEIGHTS))
+    return _ID_CHECKSUM[total % 11] == candidate[17]
+
+
+#: 中国大陆手机号：可带 +86 / 86 前缀。
+_MOBILE_RE = re.compile(r"(?<!\d)(?:\+?86[ -]?)?1[3-9]\d{9}(?!\d)")
+#: 国际号码：必须有显式 ``+``，否则 8–15 位数字会把时间戳/订单号全卷进来。
+_E164_RE = re.compile(r"(?<![\w+])\+[1-9]\d{7,14}(?!\d)")
+#: 中国固话：区号 + 连字符 + 号码；没有连字符的纯数字不猜。
+_LANDLINE_RE = re.compile(r"(?<!\d)0\d{2,3}-\d{7,8}(?!\d)")
+_ID_RE = re.compile(r"(?<![\dXx])\d{17}[\dXx](?![\dXx])")
+_CARD_RE = re.compile(r"(?<![\d-])(?:\d[ -]?){12,18}\d(?![\d-])")
+
+
+def _valid_email(value: str) -> bool:
+    """邮箱的最低校验：本地部分非空、域名含点且顶级域至少 2 个字母。"""
+    local, _, domain = value.partition("@")
+    if not local or not domain or domain.startswith(".") or ".." in value:
+        return False
+    labels = domain.split(".")
+    return len(labels) >= 2 and all(labels) and len(labels[-1]) >= 2
+
+
+#: 邮箱的替换回调：形状不合法就保留原文（`re.sub` 不接受 lambda 的宽泛类型）。
+_EMAIL_TOKEN = "[EMAIL]"
+
+
+def _replace_valid_email(match: re.Match[str]) -> str:
+    return _EMAIL_TOKEN if _valid_email(match.group(0)) else match.group(0)
+
+
+#: 可校验规则：(类型, 模式, 校验函数, 替换标记)。
+#: 顺序即优先级；身份证在银行卡之前——18 位号码内部可能凑出合法的 16 位 Luhn 串。
+_VERIFIED_RULES: tuple[
+    tuple[str, re.Pattern[str], Callable[[str], bool], str], ...
+] = (
+    ("id_number", _ID_RE, chinese_id_valid, "[ID_NUMBER]"),
+    ("bank_card", _CARD_RE, luhn_valid, "[BANK_CARD]"),
+    ("phone", _MOBILE_RE, lambda value: True, "[PHONE]"),
+    ("phone", _E164_RE, lambda value: True, "[PHONE]"),
+    ("phone", _LANDLINE_RE, lambda value: True, "[PHONE]"),
+)
+
+#: 邮箱形状（是否合法由 :func:`_valid_email` 再判）。
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+#: 形状规则：没有校验位可用，只能按形状匹配（密钥、邮箱）。
+_PATTERN_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     (
         "api_key",
         re.compile(r"\b(?:sk|pk|ghp|gho|glpat|xox[baprs])[-_][A-Za-z0-9_-]{16,}\b"),
         "[API_KEY]",
     ),
     (
-        "id_number",
-        re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)"),
-        "[ID_NUMBER]",
-    ),
-    (
-        "phone",
-        re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
-        "[PHONE]",
-    ),
-    (
         "email",
-        re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),
-        "[EMAIL]",
-    ),
-    (
-        "bank_card",
-        re.compile(r"(?<!\d)\d{16,19}(?!\d)"),
-        "[BANK_CARD]",
+        _EMAIL_RE,
+        _EMAIL_TOKEN,
     ),
 )
 
@@ -124,23 +183,129 @@ class PreparedContent:
         return bool(self.pii)
 
 
+#: 内置可脱敏的 PII 类型，供 ``GuardPolicy.pii_kinds`` 选择。
+PII_KINDS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        [kind for kind, _pattern, _check, _token in _VERIFIED_RULES]
+        + [kind for kind, _pattern, _token in _PATTERN_RULES]
+    )
+)
+
+
+@dataclass(frozen=True)
+class CustomRule:
+    """调用方自定义的脱敏规则：正则 + 替换标记。
+
+    ``validator`` 可选：给了就先跑它，返回 ``False`` 时不替换（用于"形状像但
+    校验不通过"的场景，例如合作方自己的会员号校验位）。
+    """
+
+    kind: str
+    pattern: re.Pattern[str]
+    token: str
+    validator: Callable[[str], bool] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.kind:
+            raise ValueError("kind must be non-empty")
+        if not self.token:
+            raise ValueError("token must be non-empty")
+
+    def replace(self, match: re.Match[str]) -> str:
+        """``re.sub`` 的替换回调：校验不过就保留原文。"""
+        value = match.group(0)
+        if self.validator is not None and not self.validator(value):
+            return value
+        return self.token
+
+
 @dataclass(frozen=True)
 class GuardPolicy:
-    """输入防护策略。默认值面向"只标记、不改写语义"的保守用法。"""
+    """输入防护策略。默认值面向"只标记、不改写语义"的保守用法。
+
+    ``pii_kinds`` 选择启用哪些内置规则（默认全部）；``extra_rules`` 追加自定义
+    规则。两类规则都在形状规则之前执行，避免被更粗的模式抢先切碎。
+    """
 
     max_chars: int = 0
     redact_pii: bool = True
     detect_injections: bool = True
     injection_action: Literal["flag", "block", "raise"] = "flag"
+    pii_kinds: tuple[str, ...] = PII_KINDS
+    extra_rules: tuple[CustomRule, ...] = ()
 
     def __post_init__(self) -> None:
         if self.max_chars < 0:
             raise ValueError("max_chars must be >= 0")
         if self.injection_action not in ("flag", "block", "raise"):
             raise ValueError("injection_action must be 'flag', 'block' or 'raise'")
+        unknown = [kind for kind in self.pii_kinds if kind not in PII_KINDS]
+        if unknown:
+            raise ValueError(
+                f"unknown PII kinds {unknown}; expected a subset of {list(PII_KINDS)}"
+            )
+
+    def _apply_verified(self, body: str, matches: list[PiiMatch]) -> str:
+        """按模式 + 校验函数筛选并替换；重叠时保留更长的匹配。
+
+        身份证 18 位、银行卡 16–19 位、手机 11 位会互相包含，故先收集全部候选，
+        按长度降序占位，避免同一段文本被替换两次或留下半截残片。
+        """
+        spans: list[tuple[int, int, str, str]] = []
+        for kind, pattern, check, token in _VERIFIED_RULES:
+            if kind not in self.pii_kinds:
+                continue
+            for match in pattern.finditer(body):
+                if check(match.group(0)):
+                    spans.append((match.start(), match.end(), kind, token))
+
+        spans.sort(key=lambda item: (-(item[1] - item[0]), item[0]))
+        occupied: list[tuple[int, int]] = []
+        chosen: list[tuple[int, int, str, str]] = []
+        for start, end, kind, token in spans:
+            if any(not (end <= left or start >= right) for left, right in occupied):
+                continue
+            occupied.append((start, end))
+            chosen.append((start, end, kind, token))
+
+        for start, end, kind, _token in sorted(chosen, key=lambda item: item[0]):
+            matches.append(PiiMatch(kind, start, end))
+        for start, end, _kind, token in sorted(chosen, key=lambda item: -item[0]):
+            body = body[:start] + token + body[end:]
+        return body
+
+    def _apply_custom(self, body: str, matches: list[PiiMatch]) -> str:
+        """应用自定义规则；``validator`` 返回假时保留原文。"""
+        for rule in self.extra_rules:
+            for match in list(rule.pattern.finditer(body)):
+                if rule.validator is not None and not rule.validator(match.group(0)):
+                    continue
+                matches.append(PiiMatch(rule.kind, match.start(), match.end()))
+            body = rule.pattern.sub(rule.replace, body)
+        return body
+
+    def _apply_patterns(self, body: str, matches: list[PiiMatch]) -> str:
+        """形状规则（密钥、邮箱）；邮箱额外做最低限度的格式校验。"""
+        for kind, pattern, token in _PATTERN_RULES:
+            if kind not in self.pii_kinds:
+                continue
+            for match in pattern.finditer(body):
+                if kind == "email" and not _valid_email(match.group(0)):
+                    continue
+                matches.append(PiiMatch(kind, match.start(), match.end()))
+            if kind == "email":
+                body = _EMAIL_RE.sub(_replace_valid_email, body, count=0)
+            else:
+                body = pattern.sub(token, body)
+        return body
 
     def prepare(self, text: str) -> PreparedContent:
-        """脱敏、截断并检测注入；不抛异常（拒绝由调用方按策略决定）。"""
+        """脱敏、截断并检测注入；不抛异常（拒绝由调用方按策略决定）。
+
+        处理顺序：截断 → 可校验规则 → 自定义规则 → 形状规则 → 注入检测。
+        校验失败的数字段**保持原样**：宁可漏脱敏，也不要把订单号、时间戳
+        误标成银行卡（那会破坏文本语义，还可能让下游误判）。
+        """
         body = text
         truncated = False
         if self.max_chars and len(body) > self.max_chars:
@@ -149,10 +314,9 @@ class GuardPolicy:
 
         matches: list[PiiMatch] = []
         if self.redact_pii:
-            for kind, pattern, token in _PII_RULES:
-                for match in pattern.finditer(body):
-                    matches.append(PiiMatch(kind, match.start(), match.end()))
-                body = pattern.sub(token, body)
+            body = self._apply_verified(body, matches)
+            body = self._apply_custom(body, matches)
+            body = self._apply_patterns(body, matches)
             matches.sort(key=lambda item: (item.start, item.end))
 
         injections = detect_injection(body) if self.detect_injections else ()
