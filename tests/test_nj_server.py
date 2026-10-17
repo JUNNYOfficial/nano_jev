@@ -24,7 +24,7 @@ import pytest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from nano_jev import nj_server  # noqa: E402
+from nano_jev import Label, nj_server  # noqa: E402
 
 # 本机可能配了系统级代理（macOS 的 ``_scproxy`` 会让 urllib 把 localhost 也走代理，
 # 实测会拿到 502）。测试只连本地服务，故显式禁用代理。
@@ -539,7 +539,9 @@ def test_event_stream_terminates_when_chunk_iteration_fails(
 ):
     """回归：分块流中途失败也必须补上终止块，否则客户端会一直等 chunked 结束。"""
 
-    def broken_stream(_body: Any, _topics: Any = None) -> Iterator[str]:
+    def broken_stream(
+        _body: Any, _topics: Any = None, _labeler: Any = None
+    ) -> Iterator[str]:
         yield 'data: {"partial": true}\n\n'
         raise BrokenPipeError("客户端提前断开")
 
@@ -657,3 +659,73 @@ def test_non_loopback_without_token_warns(
         assert "NANO_JV_TOKEN" in err
     finally:
         nj_server._topics, nj_server._token = previous
+
+
+@pytest.fixture()
+def hybrid_reset() -> Iterator[None]:
+    """每个级联用例后把模块状态复位，避免污染其它用例。"""
+    try:
+        yield
+    finally:
+        nj_server.configure_hybrid(None)
+
+
+def test_health_reports_hybrid_status(server_url: str, hybrid_reset: None):
+    status = _get(server_url + "/health")[1]
+
+    assert status["hybrid"] is False
+    assert status["cache"]["enabled"] is False
+
+
+def test_configure_hybrid_switches_hosted_backend(server_url: str, hybrid_reset: None):
+    calls: list[str] = []
+
+    def judge(content: str, hint: Any) -> Any:
+        calls.append(content)
+        return Label(
+            comment_id=hint.comment_id,
+            is_relevant=True,
+            sentiment="positive",
+            sentiment_score=0.9,
+            confidence=0.9,
+            intent="praise",
+        )
+
+    nj_server.configure_hybrid(judge)
+    body = {
+        "model": "nano-jev",
+        "state": {"comments": [{"comment_id": "c0", "content": "这个模型还行"}]},
+        "questions": {"c0_sentiment": {"type": "choice", "criteria": {}}},
+    }
+    _, response = _post(server_url + "/alpha/decisions", body)
+
+    assert response["answers"]["c0_sentiment"]["choice"] == "positive"
+    assert len(calls) == 1
+    assert _get(server_url + "/health")[1]["hybrid"] is True
+
+
+def test_configure_hybrid_cache_hits_do_not_call_model(
+    server_url: str, hybrid_reset: None
+):
+    calls: list[str] = []
+
+    def judge(_content: str, hint: Any) -> Any:
+        calls.append(hint.comment_id)
+        return Label(
+            hint.comment_id, True, "positive", 0.9, 0.9, "praise"
+        )
+
+    nj_server.configure_hybrid(judge, cache_namespace="test-model/v1")
+    body = {
+        "model": "nano-jev",
+        "state": {"comments": [{"comment_id": "c0", "content": "这个模型还行"}]},
+        "questions": {"c0_sentiment": {"type": "choice", "criteria": {}}},
+    }
+
+    _post(server_url + "/alpha/decisions", body)
+    _post(server_url + "/alpha/decisions", body)
+
+    assert len(calls) == 1
+    stats = _get(server_url + "/health")[1]["cache"]
+    assert stats["hits"] == 1
+    assert stats["entries"] == 1

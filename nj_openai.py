@@ -22,7 +22,7 @@ import uuid
 from collections.abc import Iterable, Iterator, Sequence
 from typing import Any, cast
 
-from .nj_engine import Label, classify, estimate_tokens
+from .nj_engine import Label, Labeler, classify, estimate_tokens
 
 #: 从用户消息里抽评论时，认这个 JSON 键。
 _COMMENTS_KEY = "comments"
@@ -196,8 +196,15 @@ def iter_stream_chunks(labels: Sequence[Label], model: str, n: int = 1) -> Itera
     yield "data: [DONE]\n\n"
 
 
-def _classify_messages(messages: object, topics: Sequence[str] | None) -> list[Label]:
-    """抽出评论并逐条粗筛，供整包与流式两条路径共用。"""
+def _classify_messages(
+    messages: object,
+    topics: Sequence[str] | None,
+    labeler: Labeler | None = None,
+) -> list[Label]:
+    """抽出评论并逐条判断（可选级联），供整包与流式两条路径共用。"""
+    comments = extract_comments(messages)
+    if labeler is not None:
+        return [labeler(comment) for comment in comments]
     return [
         classify(
             comment["comment_id"],
@@ -206,23 +213,31 @@ def _classify_messages(messages: object, topics: Sequence[str] | None) -> list[L
             like_count=comment["like_count"],
             topics=topics,
         )
-        for comment in extract_comments(messages)
+        for comment in comments
     ]
 
 
-def handle_chat(body: Any, topics: Sequence[str] | None = None) -> dict[str, Any]:
-    """一站式入口：解析 chat 请求 → 抽评论 → 粗筛 → 拼整包响应。"""
+def handle_chat(
+    body: Any,
+    topics: Sequence[str] | None = None,
+    labeler: Labeler | None = None,
+) -> dict[str, Any]:
+    """一站式入口：解析 chat 请求 → 抽评论 → 判断 → 拼整包响应。"""
     data = _as_dict(body)
     model = str(data.get("model") or "nano-jev")
     messages = data.get("messages")
-    labels = _classify_messages(messages, topics)
+    labels = _classify_messages(messages, topics, labeler)
     prompt_tokens = estimate_tokens(json.dumps(messages, ensure_ascii=False))
     return build_chat_completion(labels, model, prompt_tokens, n=coerce_n(data.get("n", 1)))
 
 
-def handle_chat_stream(body: Any, topics: Sequence[str] | None = None) -> Iterator[str]:
-    """一站式流式入口：解析 chat 请求 → 粗筛 → 产出 SSE 帧。"""
+def handle_chat_stream(
+    body: Any,
+    topics: Sequence[str] | None = None,
+    labeler: Labeler | None = None,
+) -> Iterator[str]:
+    """一站式流式入口：解析 chat 请求 → 判断 → 产出 SSE 帧。"""
     data = _as_dict(body)
     model = str(data.get("model") or "nano-jev")
-    labels = _classify_messages(data.get("messages"), topics)
+    labels = _classify_messages(data.get("messages"), topics, labeler)
     return iter_stream_chunks(labels, model, n=coerce_n(data.get("n", 1)))

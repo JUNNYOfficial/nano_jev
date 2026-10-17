@@ -29,19 +29,34 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import VERSION
+from .nj_cache import HybridCache
 from .nj_contract import DEFAULT_TOPICS, handle_decisions
-from .nj_engine import classify
+from .nj_engine import Labeler, classify
+from .nj_guard import GuardPolicy
+from .nj_hybrid import HybridPolicy
+from .nj_llm import OpenAICompatJudge, make_hybrid_labeler
 from .nj_openai import handle_chat, handle_chat_stream, wants_stream
 
 #: 主题词与访问令牌的环境变量名（命令行参数优先于它们）。
 _TOPICS_ENV = "NANO_JV_TOPICS"
 _TOKEN_ENV = "NANO_JV_TOKEN"
 
+#: 级联后端的可选环境变量（命令行参数优先）。
+_LLM_ENDPOINT_ENV = "NANO_JV_LLM_ENDPOINT"
+_LLM_MODEL_ENV = "NANO_JV_LLM_MODEL"
+_LLM_KEY_ENV = "NANO_JV_LLM_API_KEY"
+
 #: 相关性判据用的主题词（可被 CLI/环境变量覆盖，见 :func:`apply_config`）。
 _topics: tuple[str, ...] = tuple(DEFAULT_TOPICS)
 
 #: 可选的访问令牌；为空表示不鉴权。
 _token: str | None = None
+
+#: 可选的逐条判断函数。``None``（默认）表示纯确定性粗筛——服务不联网、不调模型。
+_labeler: Labeler | None = None
+
+#: 级联模式下的缓存句柄（关闭时为空缓存，用于在 ``/health`` 报 0 命中）。
+_cache: HybridCache = HybridCache(namespace="")
 
 #: 对外暴露的模型对象（OpenAI 风格），``/v1/models`` 与其子路径共用。
 _MODEL: dict[str, Any] = {"id": "nano-jev", "object": "model", "owned_by": "nano_jev"}
@@ -81,6 +96,48 @@ def parse_topics(value: str | None) -> tuple[str, ...]:
 def _env_token() -> str | None:
     """环境变量 ``NANO_JV_TOKEN`` 提供的访问令牌；未设或为空串均视为未设。"""
     return os.environ.get(_TOKEN_ENV) or None
+
+
+def configure_hybrid(
+    judge: object | None = None,
+    *,
+    policy: HybridPolicy | None = None,
+    guard: GuardPolicy | None = None,
+    cache_namespace: str = "",
+    cache_size: int = 1024,
+    cache_ttl_s: float | None = None,
+    topics: Sequence[str] | None = None,
+) -> HybridCache:
+    """启用/关闭服务的级联后端；返回生效的缓存句柄。
+
+    ``judge`` 为 ``None`` 时关闭级联，服务退回纯确定性粗筛（不联网、不调模型）。
+    否则逐条评论先粗筛，只有策略要求升级时才调用该回调。
+
+    缓存默认关闭：``cache_namespace`` 留空即不缓存。开启时请用
+    ``"<模型 id>/<提示词版本>"`` 作为命名空间，避免换模型后读到旧结论。
+    """
+    global _labeler, _cache
+    if judge is None:
+        _labeler = None
+        _cache = HybridCache(namespace="")
+        return _cache
+
+    _cache = HybridCache(
+        namespace=cache_namespace, maxsize=cache_size, ttl_s=cache_ttl_s
+    )
+    _labeler = make_hybrid_labeler(
+        judge,
+        policy=policy if policy is not None else HybridPolicy(),
+        guard=guard,
+        cache=_cache if _cache.enabled else None,
+        topics=topics if topics is not None else _topics,
+    )
+    return _cache
+
+
+def hybrid_status() -> dict[str, object]:
+    """级联后端的只读状态，供 ``/health`` 与排障使用。"""
+    return {"hybrid": _labeler is not None, "cache": _cache.stats()}
 
 
 def apply_config(topics: Sequence[str] | None = None, token: str | None = None) -> None:
@@ -280,7 +337,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._reject_method()
             return
         if path.endswith("/health"):
-            self._send_json({"status": "ok", "version": VERSION, "backend": "nano-jev"})
+            self._send_json(
+                {
+                    "status": "ok",
+                    "version": VERSION,
+                    "backend": "nano-jev",
+                    **hybrid_status(),
+                }
+            )
             return
         if path.endswith("/models"):
             self._send_json({"object": "list", "data": [dict(_MODEL)]})
@@ -327,14 +391,14 @@ class _Handler(BaseHTTPRequestHandler):
         stream_chunks: Iterable[str] | None = None
         try:
             if path.endswith("/alpha/decisions"):
-                payload = handle_decisions(body, _topics)
+                payload = handle_decisions(body, _topics, _labeler)
             elif path.endswith("/chat/completions"):
                 if wants_stream(body):
                     # 分类在 handle_chat_stream() 内同步完成，故错误仍能被下面捕获；
                     # 逐帧写出放到 try 之外，避免半途写失败后再补发 JSON 头。
-                    stream_chunks = handle_chat_stream(body, _topics)
+                    stream_chunks = handle_chat_stream(body, _topics, _labeler)
                 else:
-                    payload = handle_chat(body, _topics)
+                    payload = handle_chat(body, _topics, _labeler)
             elif path.endswith(_GET_ONLY_SUFFIXES) or "/models/" in path:
                 self._reject_method()
                 return
@@ -427,6 +491,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--topics", default=None, help="逗号分隔的主题词，覆盖默认相关性领域；未给时读 NANO_JV_TOPICS"
     )
     serve_parser.add_argument("--token", default=None, help="可选的访问令牌；未给时读 NANO_JV_TOKEN")
+    serve_parser.add_argument(
+        "--hybrid-endpoint",
+        default=None,
+        help="启用级联：OpenAI 兼容 base URL（如 http://host/v1）；未给时读 "
+        f"{_LLM_ENDPOINT_ENV}，都没有则只跑确定性粗筛",
+    )
+    serve_parser.add_argument(
+        "--hybrid-model", default=None, help=f"级联模型名；未给时读 {_LLM_MODEL_ENV}"
+    )
+    serve_parser.add_argument(
+        "--hybrid-api-key", default=None, help=f"级联模型密钥；未给时读 {_LLM_KEY_ENV}"
+    )
+    serve_parser.add_argument(
+        "--hybrid-min-confidence",
+        type=float,
+        default=0.65,
+        help="粗筛置信度低于该值时升级（启发式门槛，不是校准概率）",
+    )
+    serve_parser.add_argument(
+        "--hybrid-guard",
+        choices=("off", "flag", "block", "raise"),
+        default="flag",
+        help="输入防护：off 关闭；flag 只标记；block 命中注入时不升级；raise 直接报错",
+    )
+    serve_parser.add_argument(
+        "--hybrid-cache-namespace",
+        default="",
+        help="启用缓存所需的命名空间（建议写成 <模型>/<提示词版本>）；留空不缓存",
+    )
+    serve_parser.add_argument(
+        "--hybrid-cache-size", type=int, default=1024, help="缓存条目上限"
+    )
+    serve_parser.add_argument(
+        "--hybrid-cache-ttl", type=float, default=None, help="缓存条目存活秒数；默认不过期"
+    )
 
     label_parser = sub.add_parser("label", help="对一段文本做一次粗筛")
     label_parser.add_argument("text", nargs="?", default="")
@@ -444,11 +543,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_hybrid_from_args(args: argparse.Namespace) -> None:
+    """按命令行/环境变量启用级联；未配端点则显式关闭（保持纯确定性服务）。"""
+    endpoint = args.hybrid_endpoint or os.environ.get(_LLM_ENDPOINT_ENV)
+    if not endpoint:
+        configure_hybrid(None)
+        return
+    model = args.hybrid_model or os.environ.get(_LLM_MODEL_ENV) or "nano-jev"
+    api_key = args.hybrid_api_key or os.environ.get(_LLM_KEY_ENV) or ""
+    guard = None if args.hybrid_guard == "off" else GuardPolicy(
+        injection_action=args.hybrid_guard
+    )
+    configure_hybrid(
+        OpenAICompatJudge(endpoint=endpoint, model=model, api_key=api_key),
+        policy=HybridPolicy(minimum_confidence=args.hybrid_min_confidence),
+        guard=guard,
+        cache_namespace=args.hybrid_cache_namespace,
+        cache_size=args.hybrid_cache_size,
+        cache_ttl_s=args.hybrid_cache_ttl,
+        topics=parse_topics(args.topics),
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """命令行入口。"""
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "serve":
+        _configure_hybrid_from_args(args)
         serve(args.host, args.port, parse_topics(args.topics), args.token)
         return 0
     if args.command == "label":

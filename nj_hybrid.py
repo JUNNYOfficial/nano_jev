@@ -12,12 +12,19 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
+from threading import Lock
 from time import perf_counter
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from .nj_arbitrate import FIELDS, ConflictPolicy, merge_labels
 from .nj_engine import Label, classify
+from .nj_guard import GuardPolicy, PreparedContent, PromptInjectionError
 from .nj_vocab import INTENTS, SENTIMENTS, to_aspects, to_emotions, to_enum
+
+if TYPE_CHECKING:  # pragma: no cover - 仅类型检查时需要
+    from .nj_cache import HybridCache
 
 
 class LLMJudge(Protocol):
@@ -41,6 +48,7 @@ class HybridBudget:
 
     limit: int
     used: int = 0
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.limit < 0:
@@ -57,11 +65,16 @@ class HybridBudget:
         return self.used >= self.limit
 
     def consume(self) -> bool:
-        """尝试占用一次升级额度；成功返回 ``True``。"""
-        if self.exhausted:
-            return False
-        self.used += 1
-        return True
+        """尝试占用一次升级额度；成功返回 ``True``。
+
+        并发下必须原子：``judge_many`` 的多个线程共享同一个预算时，先查后加会
+        让两条样本同时通过检查，实际升级次数超过上限。
+        """
+        with self._lock:
+            if self.used >= self.limit:
+                return False
+            self.used += 1
+            return True
 
 
 @dataclass(frozen=True)
@@ -75,6 +88,10 @@ class HybridPolicy:
     escalate_without_aspects: bool = False
     on_budget_exhausted: Literal["nano", "raise"] = "nano"
     on_llm_error: Literal["raise", "nano"] = "raise"
+    #: 只采纳模型的这些字段；``None`` 表示整条标签都采用模型结果。
+    review_fields: tuple[str, ...] | None = None
+    #: 逐字段模式下，两边冲突时保留谁的值。
+    conflict_policy: ConflictPolicy = "prefer_model"
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.minimum_confidence <= 1.0:
@@ -85,6 +102,14 @@ class HybridPolicy:
             raise ValueError("on_budget_exhausted must be 'nano' or 'raise'")
         if self.on_llm_error not in ("raise", "nano"):
             raise ValueError("on_llm_error must be 'raise' or 'nano'")
+        if self.conflict_policy not in ("prefer_model", "prefer_coarse"):
+            raise ValueError("conflict_policy must be 'prefer_model' or 'prefer_coarse'")
+        if self.review_fields is not None:
+            unknown = [name for name in self.review_fields if name not in FIELDS]
+            if unknown:
+                raise ValueError(
+                    f"unknown review_fields {unknown}; expected a subset of {list(FIELDS)}"
+                )
 
     def escalation_reasons(
         self, label: Label, content_length: int | None = None
@@ -222,6 +247,7 @@ def _nano_result(
     *,
     llm_error: str | None = None,
     budget_exhausted: bool = False,
+    guard: PreparedContent | None = None,
 ) -> HybridResult:
     accepted = _copy_label(nano_label)
     hybrid_meta: dict[str, Any] = {
@@ -233,6 +259,8 @@ def _nano_result(
         hybrid_meta["llm_error"] = llm_error
     if budget_exhausted:
         hybrid_meta["budget_exhausted"] = True
+    if guard is not None:
+        hybrid_meta["guard"] = _guard_meta(guard)
     accepted.meta["hybrid"] = hybrid_meta
     return HybridResult(
         accepted,
@@ -242,6 +270,43 @@ def _nano_result(
         _copy_label(nano_label),
         llm_error=llm_error,
     )
+
+
+def _guard_meta(prepared: PreparedContent) -> dict[str, Any]:
+    """把防护处理记录压成可写进 ``meta`` 的扁平字典。"""
+    return {
+        "redacted": prepared.redacted,
+        "pii": [match.kind for match in prepared.pii],
+        "injections": list(prepared.injections),
+        "truncated": prepared.truncated,
+    }
+
+
+def _apply_guard(
+    body: str,
+    guard: GuardPolicy | None,
+    reasons: tuple[str, ...],
+    nano_label: Label,
+) -> tuple[str, PreparedContent | None, HybridResult | None]:
+    """按策略处理输入；返回 ``(送模型文本, 处理记录, 应直接返回的结果)``。"""
+    if guard is None:
+        return body, None, None
+    prepared = guard.prepare(body)
+    if prepared.injections:
+        if guard.injection_action == "raise":
+            raise PromptInjectionError(
+                "input matched prompt-injection patterns: "
+                + ", ".join(prepared.injections)
+            )
+        if guard.injection_action == "block":
+            return (
+                prepared.text,
+                prepared,
+                _nano_result(
+                    nano_label, (*reasons, "injection_blocked"), guard=prepared
+                ),
+            )
+    return prepared.text, prepared, None
 
 
 def judge_hybrid(
@@ -254,14 +319,32 @@ def judge_hybrid(
     llm_judge: LLMJudge | None = None,
     policy: HybridPolicy | None = None,
     budget: HybridBudget | None = None,
+    guard: GuardPolicy | None = None,
+    cache: HybridCache | None = None,
 ) -> HybridResult:
     """先运行 nano_jev，只有路由策略要求升级时才调用大模型。
 
     若样本需要升级但没有提供 ``llm_judge``，显式抛出 ``RuntimeError``，不把
     未复核的粗筛结果伪装成大模型结论。模型异常默认向上抛；设置
     ``on_llm_error="nano"`` 才退回粗筛结果，并记录异常类型。
+
+    ``guard`` 在送模型前脱敏 PII、截断并按策略处理注入模式；模型看到的是处理
+    后的文本，而引文校验仍以**原始文本**为准。``cache`` 只在命名空间非空时生效，
+    且只缓存升级后的结果。
     """
     body = "" if content is None else str(content)
+    title = "" if topic_title is None else str(topic_title)
+    active_policy = policy if policy is not None else HybridPolicy()
+
+    cache_key = None
+    if cache is not None and cache.enabled:
+        cache_key = cache.make_key(
+            body, title, like_count, topics, active_policy, guard
+        )
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
     nano_label = classify(
         comment_id,
         body,
@@ -269,7 +352,6 @@ def judge_hybrid(
         like_count=like_count,
         topics=topics,
     )
-    active_policy = policy if policy is not None else HybridPolicy()
     reasons = active_policy.escalation_reasons(nano_label, len(body.strip()))
 
     if not reasons:
@@ -281,6 +363,10 @@ def judge_hybrid(
             f"({', '.join(reasons)}), but no llm_judge callback was provided"
         )
 
+    prompt_text, prepared, blocked = _apply_guard(body, guard, reasons, nano_label)
+    if blocked is not None:
+        return blocked
+
     if budget is not None and not budget.consume():
         if active_policy.on_budget_exhausted == "raise":
             raise BudgetExceededError(
@@ -290,11 +376,12 @@ def judge_hybrid(
             nano_label,
             (*reasons, "budget_exhausted"),
             budget_exhausted=True,
+            guard=prepared,
         )
 
     started = perf_counter()
     try:
-        model_label = llm_judge(body, _copy_label(nano_label))
+        model_label = llm_judge(prompt_text, _copy_label(nano_label))
     except Exception as exc:
         if active_policy.on_llm_error == "raise":
             raise
@@ -302,6 +389,7 @@ def judge_hybrid(
             nano_label,
             (*reasons, "llm_error"),
             llm_error=type(exc).__name__,
+            guard=prepared,
         )
     duration_ms = (perf_counter() - started) * 1000.0
 
@@ -309,14 +397,27 @@ def judge_hybrid(
         raise TypeError("llm_judge must return a nano_jev Label")
 
     normalized, normalizations = _normalize_model_label(model_label, nano_label, body)
-    normalized.meta["hybrid"] = {
+    merged = merge_labels(
+        nano_label,
+        normalized,
+        getattr(active_policy, "review_fields", None),
+        conflict=getattr(active_policy, "conflict_policy", "prefer_model"),
+    )
+    for key, value in normalized.meta.items():
+        if key not in ("hybrid", "arbitration"):
+            merged.meta[key] = value
+    hybrid_meta: dict[str, Any] = {
         "source": "llm",
         "escalated": True,
         "escalation_reasons": list(reasons),
         "normalizations": list(normalizations),
     }
-    return HybridResult(
-        normalized,
+    if prepared is not None:
+        hybrid_meta["guard"] = _guard_meta(prepared)
+    merged.meta["hybrid"] = hybrid_meta
+
+    result = HybridResult(
+        merged,
         "llm",
         True,
         reasons,
@@ -324,6 +425,9 @@ def judge_hybrid(
         duration_ms,
         normalizations,
     )
+    if cache is not None and cache.enabled and cache_key is not None:
+        cache.put(cache_key, result)
+    return result
 
 
 def judge_many(
@@ -333,10 +437,20 @@ def judge_many(
     llm_judge: LLMJudge | None = None,
     policy: HybridPolicy | None = None,
     budget: HybridBudget | None = None,
+    guard: GuardPolicy | None = None,
+    cache: HybridCache | None = None,
+    workers: int = 1,
 ) -> list[HybridResult]:
-    """按输入顺序批量判断；``budget`` 在所有条目之间共享。"""
-    return [
-        judge_hybrid(
+    """按输入顺序批量判断；``budget`` / ``cache`` 在所有条目之间共享。
+
+    ``workers > 1`` 时用线程池并发调用模型。结果顺序与输入严格一致；预算与
+    缓存自身是线程安全的。模型回调若持有非线程安全状态，请保持 ``workers=1``。
+    """
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
+
+    def run(index: int, item: Mapping[str, object]) -> HybridResult:
+        return judge_hybrid(
             item.get("comment_id", index),
             item.get("content", ""),
             topic_title=item.get("topic_title", ""),
@@ -345,6 +459,11 @@ def judge_many(
             llm_judge=llm_judge,
             policy=policy,
             budget=budget,
+            guard=guard,
+            cache=cache,
         )
-        for index, item in enumerate(comments)
-    ]
+
+    if workers == 1 or len(comments) <= 1:
+        return [run(index, item) for index, item in enumerate(comments)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(lambda pair: run(*pair), enumerate(comments)))

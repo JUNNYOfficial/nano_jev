@@ -56,7 +56,7 @@ nano-jev --version                # confirm which version is installed
 nano-jev serve --port 8765        # equivalent to python -m nano_jev.nj_server
 ```
 
-The wheel ships only the package body (8 modules + `py.typed`), not `tests/`.
+The wheel ships only the package body (12 modules + `py.typed`), not `tests/`.
 
 
 ## Wiring into jev-arena (two ways)
@@ -152,13 +152,91 @@ Input → nano_jev coarse judgment → lightweight routing policy
                                     └─ ambiguous/conflicting → injected LLM → structured label
 ```
 
+### Input guard (PII / injection)
+
+```python
+from nano_jev import GuardPolicy, judge_hybrid
+
+result = judge_hybrid(
+    "c0", text,
+    llm_judge=judge,
+    guard=GuardPolicy(max_chars=4000, injection_action="block"),  # flag / block / raise
+)
+```
+
+| Capability | Behavior |
+| --- | --- |
+| PII redaction | Emails, phone numbers, national IDs, bank cards, and common API keys become `[EMAIL]`-style placeholders before the model sees them |
+| Truncation | With `max_chars > 0`, the text is truncated and flagged as `truncated` |
+| Injection detection | Matches "ignore previous instructions", "reveal your system prompt", and Chinese equivalents; `flag` records, `block` skips escalation, `raise` raises `PromptInjectionError` |
+| Wrapping | Content is wrapped in a `<content>` block with delimiters escaped |
+
+Findings are recorded under `label.meta["hybrid"]["guard"]`. This is **not a security
+boundary**: it only catches known phrasing. The real defenses remain controlled-vocabulary
+output validation and never executing model output.
+
+### Field-level escalation and arbitration
+
+Escalating a whole label wastes budget when only one column needs review.
+`review_fields` adopts only those model fields and keeps the rest coarse;
+`conflict_policy` decides who wins on disagreement:
+
+```python
+from nano_jev import HybridPolicy
+
+policy = HybridPolicy(
+    review_fields=("sentiment", "aspects"),
+    conflict_policy="prefer_model",   # or "prefer_coarse"
+)
+```
+
+Each result records `fields` / `adopted` / `conflicts` under `label.meta["arbitration"]`.
+There is no confidence averaging: neither side's score is a calibrated probability.
+
+### Cache and concurrency
+
+```python
+from nano_jev import HybridCache, HybridBudget, judge_many
+
+cache = HybridCache(namespace="local-model/prompt-v1", maxsize=2048, ttl_s=3600)
+results = judge_many(
+    comments, llm_judge=judge, cache=cache, budget=HybridBudget(limit=100), workers=8,
+)
+```
+
+* `namespace` is caller-supplied (prefer `<model>/<prompt version>`); an empty namespace
+  disables caching so a model or prompt change cannot silently reuse stale verdicts.
+* Only escalated results are cached; hits return deep copies. `stats()` reports hit rate,
+  entry count, and evictions.
+* `judge_many(workers=N)` calls the model concurrently while preserving input order;
+  `HybridBudget.consume()` is atomic, so concurrency never overspends.
+
+## Hosting the cascade (optional)
+
+```bash
+python3 -m nano_jev.nj_server serve \
+    --hybrid-endpoint http://127.0.0.1:8000/v1 \
+    --hybrid-model local-model \
+    --hybrid-guard block \
+    --hybrid-cache-namespace local-model/v1
+```
+
+* Without an endpoint the service stays **fully deterministic**: no network, no model.
+* With one, `/alpha/decisions` and `/v1/chat/completions` (including streaming) both
+  coarse-screen first and escalate by policy.
+* `/health` reports the `hybrid` switch and cache statistics.
+* `NANO_JV_LLM_ENDPOINT` / `NANO_JV_LLM_MODEL` / `NANO_JV_LLM_API_KEY` are also accepted.
+
+See [`examples/llm_judge_openai.py`](examples/llm_judge_openai.py) for library wiring:
+`OpenAICompatJudge` uses only stdlib `urllib` and plugs straight into `judge_hybrid`.
+
 ## HTTP API
 
 | Method | Path | Description |
 | --- | --- | --- |
 | POST | `/alpha/decisions` | Native Jev contract: `{model, state:{comments}, questions}` → `{answers, usage, …}` |
 | POST | `/v1/chat/completions` | OpenAI-compatible: `{model, messages}` → standard chat completion; `"stream": true` returns `text/event-stream` incremental frames |
-| GET | `/health` | Health check and version |
+| GET | `/health` | Health check, version, hybrid switch, and cache stats |
 | GET | `/v1/models` | OpenAI-style model list |
 | GET | `/v1/models/{model}` | A single model object; unknown model returns 404 |
 
@@ -192,7 +270,11 @@ an unauthenticated service to the LAN.
 
 ```bash
 python -m nano_jev.nj_server serve [--host 127.0.0.1] [--port 8765]
-                                   [--topics 模型,产品] [--token <optional access token>]
+                                   [--topics 模型,产品] [--token <access token>]
+                                   [--hybrid-endpoint URL] [--hybrid-model ID]
+                                   [--hybrid-guard off|flag|block|raise]
+                                   [--hybrid-cache-namespace NS] [--hybrid-cache-size N]
+                                   [--hybrid-cache-ttl SECONDS]
 python -m nano_jev.nj_server label "一段文本" [--id c0] [--stdin] [--topics ...]
 python -m nano_jev.nj_server decide [--file req.json] [--topics ...]
 python -m nano_jev.nj_server --version
@@ -218,6 +300,11 @@ precedence over environment variables.
 | `nj_lexicon.py` | Bilingual (Chinese/English) polarity/intent/aspect/emotion/topic cues — the only place to extend |
 | `nj_engine.py` | Coarse classifier: one text → one set of structured labels (pure function, deterministic) |
 | `nj_hybrid.py` | Cascade orchestration: coarse screen → lightweight routing → optional LLM review (provider-agnostic) |
+| `nj_guard.py` | Input guard: PII redaction, injection detection, untrusted-content wrapping |
+| `nj_arbitrate.py` | Field-level escalation and conflict arbitration |
+| `nj_cache.py` | Thread-safe LRU cache (namespace + TTL) |
+| `nj_llm.py` | OpenAI-compatible judge (stdlib urllib) and label construction |
+| `examples/` | Vendor adapter example (not shipped in the wheel) |
 | `nj_contract.py` | Parsing and response construction for the Jev `/alpha/decisions` contract |
 | `nj_openai.py` | OpenAI `/chat/completions` adapter layer (including streaming SSE) |
 | `nj_server.py` | Zero-dependency HTTP service and command-line entry point |
@@ -232,8 +319,10 @@ Dependencies are one-way: **entry point → contract/adapter → engine → voca
 two serving contract chains (native Jev, OpenAI-compatible) don't reference each other;
 they share the same deterministic core `nj_engine.classify()`. `nj_hybrid` is an optional
 library-level orchestrator: it uses that core and calls an injected LLM only when routing
-rules request escalation. The HTTP serving endpoints remain deterministic and do not call
-an LLM.
+rules request escalation. The cascade modules participate only when explicitly invoked:
+`nj_guard` (input guard) → `nj_hybrid` (routing) → `nj_arbitrate` (field arbitration),
+with `nj_cache` and `nj_llm` as optional cross-cutting pieces. Serving stays deterministic
+unless `--hybrid-endpoint` is configured.
 
 ```mermaid
 graph LR
@@ -248,7 +337,11 @@ graph LR
     end
 
     ENGINE["nj_engine.py<br/>coarse classifier classify()"]
-    HYBRID["nj_hybrid.py<br/>cascade routing + injected model callback"]
+    HYBRID["nj_hybrid.py<br/>cascade routing"]
+    GUARD["nj_guard.py<br/>PII / injection guard"]
+    ARB["nj_arbitrate.py<br/>field arbitration"]
+    CACHE["nj_cache.py<br/>result cache"]
+    LLMADAPTER["nj_llm.py<br/>OpenAI-compatible callback"]
     LLM["Caller-provided LLM"]
 
     subgraph vocab["Vocabulary & constants"]
@@ -265,6 +358,10 @@ graph LR
     CONTRACT --> LEXICON
     OPENAI --> ENGINE
     HYBRID --> ENGINE
+    HYBRID --> GUARD
+    HYBRID --> ARB
+    HYBRID --> CACHE
+    LLMADAPTER --> HYBRID
     HYBRID -. "escalated cases only" .-> LLM
     ENGINE --> VOCAB
     ENGINE --> LEXICON
@@ -321,7 +418,9 @@ the server tests **really start a server and make real HTTP requests**:
 
 ```bash
 python3 -m pytest nano_jev/tests/test_nj_engine.py nano_jev/tests/test_nj_contract.py \
-                nano_jev/tests/test_nj_openai.py nano_jev/tests/test_nj_hybrid.py -q
+                nano_jev/tests/test_nj_openai.py nano_jev/tests/test_nj_hybrid.py \
+                nano_jev/tests/test_nj_guard.py nano_jev/tests/test_nj_arbitrate.py \
+                nano_jev/tests/test_nj_cache.py nano_jev/tests/test_nj_llm.py -q
 python3 -m pytest nano_jev/tests/test_nj_server.py -q
 ```
 

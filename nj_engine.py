@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -351,3 +351,9 @@ def classify(
             "polarityHits": polarity_total,
         },
     )
+
+
+#: 逐条判断函数：接收评论字典（``comment_id`` / ``content`` / ``topic_title`` /
+#: ``like_count``），返回标签。确定性粗筛与级联判断都满足这个形状，故契约层
+#: 与服务层只需依赖它，不必知道背后是词典还是大模型。
+Labeler = Callable[[Mapping[str, Any]], Label]

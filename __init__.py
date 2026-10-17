@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+from .nj_arbitrate import FIELDS, field_agreement, merge_labels
+from .nj_cache import HybridCache
 from .nj_contract import (
     DEFAULT_TOPICS,
     DecisionsRequest,
@@ -35,6 +37,15 @@ from .nj_contract import (
     parse_decisions_request,
 )
 from .nj_engine import Label, classify, estimate_tokens
+from .nj_guard import (
+    GuardPolicy,
+    PiiMatch,
+    PreparedContent,
+    PromptInjectionError,
+    detect_injection,
+    redact_pii,
+    wrap_untrusted,
+)
 from .nj_hybrid import (
     BudgetExceededError,
     HybridBudget,
@@ -44,12 +55,14 @@ from .nj_hybrid import (
     judge_hybrid,
     judge_many,
 )
+from .nj_llm import OpenAICompatJudge, label_from_mapping
 from .nj_vocab import ASPECTS, EMOTIONS, INTENTS, MAX_ASPECTS, MAX_EMOTIONS, SENTIMENTS
 
 __all__ = [
     "ASPECTS",
     "DEFAULT_TOPICS",
     "EMOTIONS",
+    "FIELDS",
     "INTENTS",
     "MAX_ASPECTS",
     "MAX_EMOTIONS",
@@ -57,19 +70,31 @@ __all__ = [
     "VERSION",
     "BudgetExceededError",
     "DecisionsRequest",
+    "GuardPolicy",
     "HybridBudget",
+    "HybridCache",
     "HybridPolicy",
     "HybridResult",
     "LLMJudge",
     "Label",
+    "OpenAICompatJudge",
+    "PiiMatch",
+    "PreparedContent",
+    "PromptInjectionError",
     "build_answers",
     "build_decisions_response",
     "classify",
+    "detect_injection",
     "estimate_tokens",
+    "field_agreement",
     "judge_hybrid",
     "judge_many",
+    "label_from_mapping",
+    "merge_labels",
     "parse_decisions_request",
+    "redact_pii",
+    "wrap_untrusted",
 ]
 
 #: 运行时版本号，随 ``/health`` 与 ``/v1/models`` 返回，便于排查「装的是哪版」。
-VERSION = "1.1.0"
+VERSION = "1.2.0"

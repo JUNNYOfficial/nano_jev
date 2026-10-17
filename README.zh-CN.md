@@ -52,7 +52,7 @@ nano-jev --version                # 确认装的是哪版
 nano-jev serve --port 8765        # 等价于 python -m nano_jev.nj_server
 ```
 
-装出来的 wheel 只含包本体（8 个模块 + `py.typed`），不含 `tests/`。
+装出来的 wheel 只含包本体（12 个模块 + `py.typed`），不含 `tests/`。
 
 
 ## 接进 jev-arena（两种方式）
@@ -139,13 +139,88 @@ results = judge_many(
                               └─ 模糊/冲突 → 注入的大模型 → 结构化标签
 ```
 
+### 输入防护（PII / 注入）
+
+```python
+from nano_jev import GuardPolicy, judge_hybrid
+
+result = judge_hybrid(
+    "c0", text,
+    llm_judge=judge,
+    guard=GuardPolicy(max_chars=4000, injection_action="block"),  # flag / block / raise
+)
+```
+
+| 能力 | 行为 |
+| --- | --- |
+| PII 脱敏 | 邮箱、手机号、身份证、银行卡与常见密钥替换成 `[EMAIL]` 等占位符，模型看到的是脱敏文本 |
+| 截断 | `max_chars > 0` 时截断，并在结果里标记 `truncated` |
+| 注入检测 | 命中"忽略以上指令 / 输出系统提示词"等中英模式；`flag` 只记录、`block` 不升级、`raise` 抛 `PromptInjectionError` |
+| 包裹 | 送进模型的文本用 `<content>` 定界，定界符会被转义 |
+
+命中与处理记录写在 `label.meta["hybrid"]["guard"]`。**它不是安全边界**：只能挡已知
+措辞；真正的防线仍是"模型输出回到受控词表与原文校验"，以及不要把模型输出直接执行。
+
+### 字段级升级与仲裁
+
+整条升级在"只想复核某一列"时浪费预算。`review_fields` 只采纳模型的这些字段，其余
+保留粗筛值；`conflict_policy` 决定冲突时保留谁：
+
+```python
+from nano_jev import HybridPolicy
+
+policy = HybridPolicy(
+    review_fields=("sentiment", "aspects"),   # 只复核情绪与维度
+    conflict_policy="prefer_model",           # 或 "prefer_coarse"
+)
+```
+
+每个结果的 `label.meta["arbitration"]` 记录 `fields` / `adopted` / `conflicts`。
+仲裁不做"两边置信度加权平均"——两个分数都不是校准概率，平均没有可信含义。
+
+### 缓存与并发
+
+```python
+from nano_jev import HybridCache, HybridBudget, judge_many
+
+cache = HybridCache(namespace="local-model/prompt-v1", maxsize=2048, ttl_s=3600)
+results = judge_many(
+    comments, llm_judge=judge, cache=cache, budget=HybridBudget(limit=100), workers=8,
+)
+```
+
+* `namespace` 必须由调用方给出（建议 `<模型>/<提示词版本>`）；留空则不缓存。
+  这是为了避免换模型或改提示词后仍读到旧结论。
+* 缓存只存升级后的结果，命中返回深拷贝；`stats()` 给出命中率、条目数与淘汰数。
+* `judge_many(workers=N)` 并发调用模型，结果顺序与输入一致；预算的 `consume()`
+  是原子的，并发下不会超发。
+
+## 服务化（可选级联后端）
+
+```bash
+python3 -m nano_jev.nj_server serve \
+    --hybrid-endpoint http://127.0.0.1:8000/v1 \
+    --hybrid-model local-model \
+    --hybrid-guard block \
+    --hybrid-cache-namespace local-model/v1
+```
+
+* 未配置端点时，服务保持**纯确定性**：不联网、不调模型。
+* 配置后，`/alpha/decisions` 与 `/v1/chat/completions`（含流式）都会先粗筛、按策略升级。
+* `/health` 返回 `hybrid` 开关与缓存命中统计。
+* 端点、模型与密钥也可用 `NANO_JV_LLM_ENDPOINT` / `NANO_JV_LLM_MODEL` /
+  `NANO_JV_LLM_API_KEY` 提供。
+
+库内装配见 [`examples/llm_judge_openai.py`](examples/llm_judge_openai.py)：
+`OpenAICompatJudge` 只用标准库 `urllib`，可直接传给 `judge_hybrid`。
+
 ## HTTP 接口
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/alpha/decisions` | Jev 原生契约：`{model, state:{comments}, questions}` → `{answers, usage, …}` |
 | POST | `/v1/chat/completions` | OpenAI 兼容：`{model, messages}` → 标准 chat completion；`"stream": true` 时回 `text/event-stream` 增量帧 |
-| GET | `/health` | 健康检查与版本 |
+| GET | `/health` | 健康检查、版本、级联开关与缓存统计 |
 | GET | `/v1/models` | OpenAI 风格的模型清单 |
 | GET | `/v1/models/{model}` | 单个模型对象；未知模型回 404 |
 
@@ -176,6 +251,10 @@ results = judge_many(
 ```bash
 python -m nano_jev.nj_server serve [--host 127.0.0.1] [--port 8765]
                                    [--topics 模型,产品] [--token <可选访问令牌>]
+                                   [--hybrid-endpoint URL] [--hybrid-model ID]
+                                   [--hybrid-guard off|flag|block|raise]
+                                   [--hybrid-cache-namespace NS] [--hybrid-cache-size N]
+                                   [--hybrid-cache-ttl SECONDS]
 python -m nano_jev.nj_server label "一段文本" [--id c0] [--stdin] [--topics ...]
 python -m nano_jev.nj_server decide [--file req.json] [--topics ...]
 python -m nano_jev.nj_server --version
@@ -199,6 +278,11 @@ python -m nano_jev.nj_server --version
 | `nj_lexicon.py` | 中英双语的极性/意图/维度/情绪/主题线索（唯一需要扩充的地方） |
 | `nj_engine.py` | 粗筛引擎：一条文本 → 一套结构化标签（纯函数、确定性） |
 | `nj_hybrid.py` | 级联编排：初筛 → 轻量路由 → 可选的大模型复核（供应商无关） |
+| `nj_guard.py` | 输入防护：PII 脱敏、注入检测、不可信内容包裹 |
+| `nj_arbitrate.py` | 字段级升级与冲突仲裁 |
+| `nj_cache.py` | 线程安全的 LRU 缓存（命名空间 + TTL） |
+| `nj_llm.py` | OpenAI 兼容判断器（标准库 urllib）与标签构造 |
+| `examples/` | 供应商适配示例（不随 wheel 分发） |
 | `nj_contract.py` | Jev `/alpha/decisions` 契约的解析与响应构造 |
 | `nj_openai.py` | OpenAI `/chat/completions` 适配层（含流式 SSE） |
 | `nj_server.py` | 零依赖 HTTP 服务与命令行入口 |
@@ -211,7 +295,9 @@ python -m nano_jev.nj_server --version
 
 依赖是单向的：**入口 → 契约/适配 → 引擎 → 词表**。两条契约链路（Jev 原生、OpenAI
 兼容）互不引用，只共享同一个确定性核心 `nj_engine.classify()`；`nj_vocab` / `nj_lexicon`
-是被依赖的叶子，也是唯一需要跟随上游扩充的地方。
+是被依赖的叶子，也是唯一需要跟随上游扩充的地方。级联相关模块只在被显式调用时
+才参与：`nj_guard`（输入防护）→ `nj_hybrid`（路由）→ `nj_arbitrate`（字段仲裁），
+`nj_cache` 与 `nj_llm` 是可选的横切件。
 
 ```mermaid
 graph LR
@@ -240,8 +326,16 @@ graph LR
     CONTRACT --> VOCAB
     CONTRACT --> LEXICON
     OPENAI --> ENGINE
-    HYBRID["nj_hybrid.py<br/>级联路由与模型回调"]
+    HYBRID["nj_hybrid.py<br/>级联路由"]
+    GUARD["nj_guard.py<br/>PII / 注入防护"]
+    ARB["nj_arbitrate.py<br/>字段级仲裁"]
+    CACHE["nj_cache.py<br/>结果缓存"]
+    LLMADAPTER["nj_llm.py<br/>OpenAI 兼容回调"]
     HYBRID --> ENGINE
+    HYBRID --> GUARD
+    HYBRID --> ARB
+    HYBRID --> CACHE
+    LLMADAPTER --> HYBRID
     HYBRID -. "仅疑难样本" .-> LLM["调用方注入的大模型"]
     ENGINE --> VOCAB
     ENGINE --> LEXICON
@@ -249,9 +343,10 @@ graph LR
 
 ### 请求处理流程
 
-一次 `POST` 从进服务到出响应：先鉴权、再解析 JSON、按路径分流到两条契约链路；两条链
-路都把评论交给同一个 `classify()` 逐条粗筛，最后拼成各自契约形状的 JSON。**全程无网
-络、无模型调用**，故同样输入必然得到同样响应。
+一次 `POST` 从进服务到出响应：先鉴权、再解析 JSON、按路径分流到两条契约链路；默认
+两条链路都把评论交给同一个 `classify()` 逐条粗筛，最后拼成各自契约形状的 JSON。**默认
+全程无网络、无模型调用**，故同样输入必然得到同样响应。配置 `--hybrid-endpoint` 后，
+路由才会在疑难样本上调用一次模型；响应形状不变。
 
 ```mermaid
 flowchart TD
@@ -296,7 +391,9 @@ python3 -m pytest nano_jev/ -q
 
 ```bash
 python3 -m pytest nano_jev/tests/test_nj_engine.py nano_jev/tests/test_nj_contract.py \
-                nano_jev/tests/test_nj_openai.py nano_jev/tests/test_nj_hybrid.py -q
+                nano_jev/tests/test_nj_openai.py nano_jev/tests/test_nj_hybrid.py \
+                nano_jev/tests/test_nj_guard.py nano_jev/tests/test_nj_arbitrate.py \
+                nano_jev/tests/test_nj_cache.py nano_jev/tests/test_nj_llm.py -q
 python3 -m pytest nano_jev/tests/test_nj_server.py -q
 ```
 

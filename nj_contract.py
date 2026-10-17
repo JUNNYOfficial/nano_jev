@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from . import nj_lexicon as lx
-from .nj_engine import Label, classify, estimate_tokens
+from .nj_engine import Label, Labeler, classify, estimate_tokens
 from .nj_vocab import ASPECTS, EMOTIONS, INTENTS, SENTIMENTS
 
 #: 形如 ``c3_sentiment`` / ``c12_aspect_capability`` 的问题 id。
@@ -107,8 +107,18 @@ def parse_decisions_request(body: Any) -> DecisionsRequest:
     return DecisionsRequest(model=model, comments=comments, questions=questions)
 
 
-def label_comments(request: DecisionsRequest, topics: Sequence[str] | None = None) -> list[Label]:
-    """对请求里的每条评论跑一次粗筛，顺序与 ``comments`` 严格一致。"""
+def label_comments(
+    request: DecisionsRequest,
+    topics: Sequence[str] | None = None,
+    labeler: Labeler | None = None,
+) -> list[Label]:
+    """对请求里的每条评论跑一次判断，顺序与 ``comments`` 严格一致。
+
+    ``labeler`` 为服务层可选注入的逐条判断函数（例如级联判断）；未提供时走
+    确定性粗筛。两者都只接收评论字典，故契约层不需要知道级联的细节。
+    """
+    if labeler is not None:
+        return [labeler(comment) for comment in request.comments]
     return [
         classify(
             comment["comment_id"],
@@ -310,10 +320,14 @@ def build_decisions_response(
     }
 
 
-def handle_decisions(body: Any, topics: Sequence[str] | None = None) -> dict[str, Any]:
-    """一站式入口：解析请求 → 粗筛 → 构造响应。"""
+def handle_decisions(
+    body: Any,
+    topics: Sequence[str] | None = None,
+    labeler: Labeler | None = None,
+) -> dict[str, Any]:
+    """一站式入口：解析请求 → 逐条判断（可选级联）→ 构造响应。"""
     request = parse_decisions_request(body)
-    labels = label_comments(request, topics=topics)
+    labels = label_comments(request, topics=topics, labeler=labeler)
     return build_decisions_response(request, labels)
 
 
