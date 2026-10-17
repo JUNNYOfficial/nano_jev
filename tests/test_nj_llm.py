@@ -6,6 +6,7 @@ import io
 import json
 import pathlib
 import sys
+import urllib.error
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
@@ -121,3 +122,92 @@ def test_labeler_routes_through_hybrid(monkeypatch):
 
     assert label.sentiment == "positive"
     assert calls == ["这个模型还行"]
+
+
+def _http_error(code: int, retry_after: str | None = None):
+    import email.message
+    import urllib.error
+
+    headers = email.message.Message()
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return urllib.error.HTTPError(
+        "http://host/v1/chat/completions", code, "err", headers, io.BytesIO(b"")
+    )
+
+
+def test_retries_transient_429_then_succeeds(monkeypatch):
+    sleeps: list[float] = []
+    calls = {"n": 0}
+    payload = {"choices": [{"message": {"content": '{"sentiment": "positive"}'}}]}
+
+    def opener(request, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _http_error(429, retry_after="2")
+        return _FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr("urllib.request.urlopen", opener)
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    judge = OpenAICompatJudge("http://host/v1", "m", retries=2)
+
+    label = judge("文本", Label("c0", True, "neutral", 0.0, 0.5, "other"))
+
+    assert label.sentiment == "positive"
+    assert calls["n"] == 2
+    assert sleeps == [2.0]  # 用了 Retry-After
+
+
+def test_does_not_retry_client_errors(monkeypatch):
+    calls = {"n": 0}
+
+    def opener(request, timeout=None):
+        calls["n"] += 1
+        raise _http_error(400)
+
+    monkeypatch.setattr("urllib.request.urlopen", opener)
+    judge = OpenAICompatJudge("http://host/v1", "m", retries=3)
+
+    with pytest.raises(urllib.error.HTTPError, match="400"):
+        judge("文本", Label("c0", True, "neutral", 0.0, 0.5, "other"))
+    assert calls["n"] == 1
+
+
+def test_retry_exhaustion_reraises(monkeypatch):
+    calls = {"n": 0}
+
+    def opener(request, timeout=None):
+        calls["n"] += 1
+        raise _http_error(503)
+
+    monkeypatch.setattr("urllib.request.urlopen", opener)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    judge = OpenAICompatJudge("http://host/v1", "m", retries=2)
+
+    with pytest.raises(urllib.error.HTTPError, match="503"):
+        judge("文本", Label("c0", True, "neutral", 0.0, 0.5, "other"))
+    assert calls["n"] == 3
+
+
+def test_backoff_is_exponential_without_retry_after(monkeypatch):
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def opener(request, timeout=None):
+        calls["n"] += 1
+        raise _http_error(500)
+
+    monkeypatch.setattr("urllib.request.urlopen", opener)
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    judge = OpenAICompatJudge("http://host/v1", "m", retries=2, backoff_s=0.25)
+
+    with pytest.raises(urllib.error.HTTPError, match="500"):
+        judge("文本", Label("c0", True, "neutral", 0.0, 0.5, "other"))
+    assert sleeps == [0.25, 0.5]
+
+
+def test_retry_settings_are_validated():
+    with pytest.raises(ValueError, match="retries"):
+        OpenAICompatJudge("http://h/v1", "m", retries=-1)
+    with pytest.raises(ValueError, match="backoff_s"):
+        OpenAICompatJudge("http://h/v1", "m", backoff_s=-1)

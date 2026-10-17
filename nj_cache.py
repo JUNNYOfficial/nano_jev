@@ -53,8 +53,9 @@ def copy_result(result: HybridResult) -> HybridResult:
 def fingerprint(value: object) -> str:
     """把 dataclass 策略压成稳定字符串，作为缓存键的一部分。
 
-    只读取数据字段；任何 ``field(repr=False)`` 的运行时句柄（锁、计数器）都
-    不参与，否则同一份策略会因对象 id 不同而永远不命中。
+    只读取**构造期字段**（``init=True``）。``init=False`` 的字段是运行时状态
+    （锁、计数、上一次决策），若参与指纹，缓存键会随每次调用变化、永远无法命中——
+    实测 ``BrainInspiredPolicy.last`` 就会造成这种漂移。
     """
     from dataclasses import fields as dataclass_fields
     from dataclasses import is_dataclass
@@ -63,7 +64,7 @@ def fingerprint(value: object) -> str:
         return repr(value)
     parts: list[str] = []
     for item in dataclass_fields(value):
-        if not item.repr:
+        if not item.init:
             continue
         parts.append(f"{item.name}={getattr(value, item.name)!r}")
     return ";".join(parts)
@@ -82,8 +83,12 @@ class HybridCache:
     hits: int = field(default=0, init=False, repr=False)
     misses: int = field(default=0, init=False, repr=False)
     evictions: int = field(default=0, init=False, repr=False)
+    coalesced: int = field(default=0, init=False, repr=False)
     _entries: OrderedDict[CacheKey, tuple[float, HybridResult]] = field(
         default_factory=OrderedDict, init=False, repr=False
+    )
+    _flights: dict[CacheKey, threading.Event] = field(
+        default_factory=dict, init=False, repr=False
     )
     _lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
@@ -145,6 +150,55 @@ class HybridCache:
                 self._entries.popitem(last=False)
                 self.evictions += 1
 
+    def begin(
+        self, key: CacheKey, *, flight_timeout: float = 120.0
+    ) -> tuple[HybridResult | None, threading.Event | None]:
+        """查缓存并合并并发请求；返回 ``(命中结果, 计算完成事件)``。
+
+        命中时返回 ``(结果, None)``。未命中时：
+        * 第一个调用者成为 **leader**，拿到 ``(None, event)``，计算完必须调用
+          :meth:`finish`（``finally`` 里也要调用，否则跟随者会一直等）；
+        * 其余调用者等待 leader 发布结果，命中则直接返回；leader 失败时它们会
+          重新竞争成为 leader。
+
+        这样 8 个相同的并发请求只付一次模型调用，而不是 8 次。
+        """
+        for _attempt in range(3):
+            with self._lock:
+                entry = self._entries.get(key)
+                if entry is not None:
+                    stored_at, value = entry
+                    fresh = (
+                        self.ttl_s is None
+                        or time.monotonic() - stored_at <= self.ttl_s
+                    )
+                    if fresh:
+                        self._entries.move_to_end(key)
+                        self.hits += 1
+                        return copy_result(value), None
+                    del self._entries[key]
+
+                event = self._flights.get(key)
+                if event is None:
+                    event = threading.Event()
+                    self._flights[key] = event
+                    self.misses += 1
+                    return None, event
+                self.coalesced += 1
+
+            event.wait(flight_timeout)
+            # 醒来后回到循环顶部重新查缓存；leader 已写入就直接命中。
+        # 连续多轮都没拿到结果（leader 反复失败/超时）：退化为自行计算，不再等待。
+        self.misses += 1
+        return None, None
+
+    def finish(self, key: CacheKey, event: threading.Event) -> None:
+        """结束一次 leader 计算：移除航班标记并唤醒跟随者。"""
+        with self._lock:
+            if self._flights.get(key) is event:
+                del self._flights[key]
+        event.set()
+
     def clear(self) -> None:
         """清空内容（计数保留，便于观察长期命中率）。"""
         with self._lock:
@@ -160,5 +214,6 @@ class HybridCache:
                 "hits": self.hits,
                 "misses": self.misses,
                 "evictions": self.evictions,
+                "coalesced": self.coalesced,
                 "hit_rate": round(self.hits / total, 4) if total else 0.0,
             }

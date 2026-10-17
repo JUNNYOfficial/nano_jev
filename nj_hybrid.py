@@ -309,50 +309,26 @@ def _apply_guard(
     return prepared.text, prepared, None
 
 
-def judge_hybrid(
+def _judge_once(
     comment_id: object,
-    content: object,
-    topic_title: object = "",
-    like_count: object = 0,
-    topics: Sequence[str] | None = None,
-    *,
-    llm_judge: LLMJudge | None = None,
-    policy: HybridPolicy | None = None,
-    budget: HybridBudget | None = None,
-    guard: GuardPolicy | None = None,
-    cache: HybridCache | None = None,
+    body: str,
+    title: str,
+    like_count: object,
+    topics: Sequence[str] | None,
+    llm_judge: LLMJudge | None,
+    policy: Any,
+    budget: HybridBudget | None,
+    guard: GuardPolicy | None,
 ) -> HybridResult:
-    """先运行 nano_jev，只有路由策略要求升级时才调用大模型。
-
-    若样本需要升级但没有提供 ``llm_judge``，显式抛出 ``RuntimeError``，不把
-    未复核的粗筛结果伪装成大模型结论。模型异常默认向上抛；设置
-    ``on_llm_error="nano"`` 才退回粗筛结果，并记录异常类型。
-
-    ``guard`` 在送模型前脱敏 PII、截断并按策略处理注入模式；模型看到的是处理
-    后的文本，而引文校验仍以**原始文本**为准。``cache`` 只在命名空间非空时生效，
-    且只缓存升级后的结果。
-    """
-    body = "" if content is None else str(content)
-    title = "" if topic_title is None else str(topic_title)
-    active_policy = policy if policy is not None else HybridPolicy()
-
-    cache_key = None
-    if cache is not None and cache.enabled:
-        cache_key = cache.make_key(
-            body, title, like_count, topics, active_policy, guard
-        )
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-
+    """单条判断的全部逻辑（缓存之外的那部分）。"""
     nano_label = classify(
         comment_id,
         body,
-        topic_title=topic_title,
+        topic_title=title,
         like_count=like_count,
         topics=topics,
     )
-    reasons = active_policy.escalation_reasons(nano_label, len(body.strip()))
+    reasons = policy.escalation_reasons(nano_label, len(body.strip()))
 
     if not reasons:
         return _nano_result(nano_label, reasons)
@@ -368,7 +344,7 @@ def judge_hybrid(
         return blocked
 
     if budget is not None and not budget.consume():
-        if active_policy.on_budget_exhausted == "raise":
+        if getattr(policy, "on_budget_exhausted", "nano") == "raise":
             raise BudgetExceededError(
                 f"LLM escalation budget exhausted after {budget.used} call(s)"
             )
@@ -383,7 +359,7 @@ def judge_hybrid(
     try:
         model_label = llm_judge(prompt_text, _copy_label(nano_label))
     except Exception as exc:
-        if active_policy.on_llm_error == "raise":
+        if getattr(policy, "on_llm_error", "raise") == "raise":
             raise
         return _nano_result(
             nano_label,
@@ -400,8 +376,8 @@ def judge_hybrid(
     merged = merge_labels(
         nano_label,
         normalized,
-        getattr(active_policy, "review_fields", None),
-        conflict=getattr(active_policy, "conflict_policy", "prefer_model"),
+        getattr(policy, "review_fields", None),
+        conflict=getattr(policy, "conflict_policy", "prefer_model"),
     )
     for key, value in normalized.meta.items():
         if key not in ("hybrid", "arbitration"):
@@ -416,7 +392,7 @@ def judge_hybrid(
         hybrid_meta["guard"] = _guard_meta(prepared)
     merged.meta["hybrid"] = hybrid_meta
 
-    result = HybridResult(
+    return HybridResult(
         merged,
         "llm",
         True,
@@ -425,9 +401,64 @@ def judge_hybrid(
         duration_ms,
         normalizations,
     )
-    if cache is not None and cache.enabled and cache_key is not None:
-        cache.put(cache_key, result)
-    return result
+
+
+def judge_hybrid(
+    comment_id: object,
+    content: object,
+    topic_title: object = "",
+    like_count: object = 0,
+    topics: Sequence[str] | None = None,
+    *,
+    llm_judge: LLMJudge | None = None,
+    policy: Any = None,
+    budget: HybridBudget | None = None,
+    guard: GuardPolicy | None = None,
+    cache: HybridCache | None = None,
+) -> HybridResult:
+    """先运行 nano_jev，只有路由策略要求升级时才调用大模型。
+
+    若样本需要升级但没有提供 ``llm_judge``，显式抛出 ``RuntimeError``，不把
+    未复核的粗筛结果伪装成大模型结论。模型异常默认向上抛；设置
+    ``on_llm_error="nano"`` 才退回粗筛结果，并记录异常类型。
+
+    ``guard`` 在送模型前脱敏 PII、截断并按策略处理注入模式；模型看到的是处理
+    后的文本，而引文校验仍以**原始文本**为准。``cache`` 只在命名空间非空时生效，
+    且只缓存升级后的结果；并发相同请求会合并成一次模型调用（single-flight）。
+    """
+    body = "" if content is None else str(content)
+    title = "" if topic_title is None else str(topic_title)
+    active_policy = policy if policy is not None else HybridPolicy()
+
+    cached: HybridResult | None = None
+    cache_key = None
+    flight = None
+    if cache is not None and cache.enabled:
+        cache_key = cache.make_key(
+            body, title, like_count, topics, active_policy, guard
+        )
+        cached, flight = cache.begin(cache_key)
+        if cached is not None:
+            return cached
+
+    try:
+        result = _judge_once(
+            comment_id,
+            body,
+            title,
+            like_count,
+            topics,
+            llm_judge,
+            active_policy,
+            budget,
+            guard,
+        )
+        if cache is not None and cached is None and flight is not None:
+            cache.put(cache_key, result)  # type: ignore[arg-type]
+        return result
+    finally:
+        if cache is not None and flight is not None:
+            cache.finish(cache_key, flight)  # type: ignore[arg-type]
 
 
 def judge_many(

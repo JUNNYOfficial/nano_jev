@@ -126,3 +126,86 @@ def test_validation():
         HybridCache(namespace="m", maxsize=0)
     with pytest.raises(ValueError, match="ttl_s"):
         HybridCache(namespace="m", ttl_s=0)
+
+
+def test_single_flight_coalesces_concurrent_misses():
+    """8 个相同并发请求只应产生一次计算，其余等待并命中。"""
+    cache = HybridCache(namespace="m/v1")
+    key = cache.make_key("文本", "", 0, None, HybridPolicy())
+    calls: list[int] = []
+    results: list = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        cached, flight = cache.begin(key)
+        if cached is not None:
+            with lock:
+                results.append(cached)
+            return
+        with lock:
+            calls.append(1)
+        time.sleep(0.05)
+        value = _result()
+        if flight is not None:
+            cache.put(key, value)
+            cache.finish(key, flight)
+        with lock:
+            results.append(value)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(calls) == 1
+    assert len(results) == 8
+    stats = cache.stats()
+    assert stats["misses"] == 1
+    assert stats["hits"] == 7
+    assert stats["coalesced"] == 7
+
+
+def test_single_flight_recovers_when_leader_fails():
+    """leader 计算失败（未写入）时，跟随者应重新成为 leader 而不是永远挂住。"""
+    cache = HybridCache(namespace="m/v1")
+    key = cache.make_key("文本", "", 0, None, HybridPolicy())
+    calls: list[str] = []
+
+    def failing_leader() -> None:
+        _, flight = cache.begin(key)
+        calls.append("leader-failed")
+        assert flight is not None
+        cache.finish(key, flight)  # 不 put，模拟失败
+
+    def follower() -> None:
+        cached, flight = cache.begin(key)
+        if cached is None:
+            calls.append("follower-became-leader")
+            assert flight is not None
+            cache.put(key, _result())
+            cache.finish(key, flight)
+
+    thread = threading.Thread(target=failing_leader)
+    thread.start()
+    thread.join()
+    follower()
+
+    assert calls == ["leader-failed", "follower-became-leader"]
+    assert cache.get(key) is not None
+
+
+def test_fingerprint_ignores_runtime_state():
+    """回归：init=False 的运行时字段不得进入缓存键，否则缓存永不命中。"""
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class Policy:
+        threshold: float = 0.5
+        last: object = field(default=None, init=False)
+
+    policy = Policy()
+    before = fingerprint(policy)
+    policy.last = object()
+
+    assert fingerprint(policy) == before

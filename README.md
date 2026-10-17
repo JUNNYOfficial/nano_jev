@@ -210,6 +210,8 @@ results = judge_many(
   entry count, and evictions.
 * `judge_many(workers=N)` calls the model concurrently while preserving input order;
   `HybridBudget.consume()` is atomic, so concurrency never overspends.
+* **Identical concurrent requests are coalesced** (single-flight): the first one calls
+  the model and the rest wait for and reuse its result; `stats()["coalesced"]` counts them.
 
 ## Hosting the cascade (optional)
 
@@ -225,7 +227,11 @@ python3 -m nano_jev.nj_server serve \
 * With one, `/alpha/decisions` and `/v1/chat/completions` (including streaming) both
   coarse-screen first and escalate by policy.
 * `/health` reports the `hybrid` switch and cache statistics.
-* `NANO_JV_LLM_ENDPOINT` / `NANO_JV_LLM_MODEL` / `NANO_JV_LLM_API_KEY` are also accepted.
+* `NANO_JV_LLM_ENDPOINT` / `NANO_JV_LLM_MODEL` / `NANO_JV_LLM_API_KEY` are also accepted;
+  `--hybrid-timeout` controls the per-call timeout.
+* Error semantics: injection blocked under `raise` → **400**; escalation budget
+  exhausted → **429**; model output violating the contract → **502**; anything else → 500.
+* `/health` exposes `metrics` with label count, escalation count, and model errors.
 
 See [`examples/llm_judge_openai.py`](examples/llm_judge_openai.py) for library wiring:
 `OpenAICompatJudge` uses only stdlib `urllib` and plugs straight into `judge_hybrid`.
@@ -236,7 +242,7 @@ See [`examples/llm_judge_openai.py`](examples/llm_judge_openai.py) for library w
 | --- | --- | --- |
 | POST | `/alpha/decisions` | Native Jev contract: `{model, state:{comments}, questions}` → `{answers, usage, …}` |
 | POST | `/v1/chat/completions` | OpenAI-compatible: `{model, messages}` → standard chat completion; `"stream": true` returns `text/event-stream` incremental frames |
-| GET | `/health` | Health check, version, hybrid switch, and cache stats |
+| GET | `/health` | Health check, version, hybrid switch, cache stats, and cascade counters |
 | GET | `/v1/models` | OpenAI-style model list |
 | GET | `/v1/models/{model}` | A single model object; unknown model returns 404 |
 
@@ -253,7 +259,9 @@ Error codes at a glance:
 | 404 | Unknown path |
 | 405 | Known path but wrong method; response carries an `Allow` header. **No longer** falls back to Python's default HTML 501 |
 | 413 | Body exceeds 32 MiB |
+| 429 | Escalation budget exhausted (`--hybrid-endpoint` mode only) |
 | 500 | Internal error; details go only to server stderr, the client gets a generic message — no leaking exception text |
+| 502 | Model output violated the label contract (bad JSON, out-of-range field) |
 
 `OPTIONS` returns 204 + `Allow` for method discovery.
 

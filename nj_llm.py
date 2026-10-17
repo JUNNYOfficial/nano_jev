@@ -12,9 +12,10 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any
@@ -100,14 +101,43 @@ class OpenAICompatJudge:
     timeout: float = 60.0
     prompt_template: str = DEFAULT_PROMPT
     extra_body: Mapping[str, Any] = field(default_factory=dict)
+    #: 额外重试次数（不含首次请求）；只对可重试错误生效。
+    retries: int = 1
+    #: 指数退避的基数秒数。
+    backoff_s: float = 0.5
+    #: ``Retry-After`` 的最大等待秒数，避免被超大值拖住。
+    max_retry_after_s: float = 30.0
     last_input_tokens: int = field(default=0, init=False)
     last_output_tokens: int = field(default=0, init=False)
     last_duration_ms: float = field(default=0.0, init=False)
 
+    #: 可重试的 HTTP 状态码：限流、超时与上游 5xx。
+    RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+    def __post_init__(self) -> None:
+        if self.retries < 0:
+            raise ValueError("retries must be >= 0")
+        if self.backoff_s < 0:
+            raise ValueError("backoff_s must be >= 0")
+
     @property
     def namespace(self) -> str:
-        """缓存命名空间：模型 + 提示词模板的稳定指纹。"""
-        return f"{self.model}/{abs(hash(self.prompt_template)):x}"
+        """缓存命名空间：模型 + 提示词模板 + 重试策略的稳定指纹。"""
+        return f"{self.model}/{abs(hash(self.prompt_template)):x}/r{self.retries}"
+
+    def _retry_delay(self, exc: Exception, attempt: int) -> float:
+        """第 ``attempt`` 次重试前的等待；``Retry-After`` 优先于指数退避。"""
+        retry_after = None
+        if isinstance(exc, urllib.error.HTTPError) and exc.headers is not None:
+            header = exc.headers.get("Retry-After")
+            if header:
+                try:
+                    retry_after = float(header)
+                except (TypeError, ValueError):
+                    retry_after = None
+        if retry_after is not None:
+            return min(max(0.0, retry_after), self.max_retry_after_s)
+        return self.backoff_s * (2**attempt)
 
     def build_prompt(self, content: str) -> str:
         """把文本包成不可信数据块后填进模板。
@@ -124,22 +154,38 @@ class OpenAICompatJudge:
         )
 
     def __call__(self, content: str, nano_label: Label, /) -> Label:
-        """发送一次请求并解析成 ``Label``；HTTP/解析错误原样抛出。"""
+        """发送请求并解析成 ``Label``；可重试错误按配置退避重试。
+
+        只重试"再试一次可能成功"的错误（429/5xx/网络中断）；400/401 这类契约或
+        鉴权错误立即抛出，重试只会浪费时间。
+        """
         payload: dict[str, Any] = {
             "model": self.model,
             "temperature": 0,
             "messages": [{"role": "user", "content": self.build_prompt(content)}],
         }
         payload.update(self.extra_body)
-        request = urllib.request.Request(
-            self.endpoint.rstrip("/") + "/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=self._headers(),
-            method="POST",
-        )
+        data = json.dumps(payload).encode("utf-8")
         started = perf_counter()
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            body = json.loads(response.read().decode("utf-8"))
+        for attempt in range(self.retries + 1):
+            request = urllib.request.Request(
+                self.endpoint.rstrip("/") + "/chat/completions",
+                data=data,
+                headers=self._headers(),
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code not in self.RETRYABLE_STATUS or attempt >= self.retries:
+                    raise
+                time.sleep(self._retry_delay(exc, attempt))
+            except urllib.error.URLError as exc:
+                if attempt >= self.retries:
+                    raise
+                time.sleep(self._retry_delay(exc, attempt))
         self.last_duration_ms = (perf_counter() - started) * 1000.0
 
         message = body["choices"][0]["message"]["content"]
@@ -169,16 +215,19 @@ def make_hybrid_labeler(
     guard: Any = None,
     cache: Any = None,
     topics: Any = None,
+    on_result: Callable[[Any], None] | None = None,
 ):
     """构造 ``comment dict -> Label`` 的标注函数，供服务层逐条调用。
 
     这样 ``nj_server`` / ``nj_contract`` 不必知道 ``judge_hybrid`` 的参数细节。
+    ``on_result`` 会在每条判断后收到完整的 ``HybridResult``，供服务层统计
+    升级率、模型错误等；它收到的对象与返回值共享，不应修改。
     """
 
     def label_comment(comment: Mapping[str, Any]) -> Label:
         from .nj_hybrid import judge_hybrid
 
-        return judge_hybrid(
+        outcome = judge_hybrid(
             comment.get("comment_id", ""),
             comment.get("content", ""),
             topic_title=comment.get("topic_title", ""),
@@ -189,6 +238,9 @@ def make_hybrid_labeler(
             budget=budget,
             guard=guard,
             cache=cache,
-        ).label
+        )
+        if on_result is not None:
+            on_result(outcome)
+        return outcome.label
 
     return label_comment

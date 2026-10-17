@@ -32,8 +32,8 @@ from . import VERSION
 from .nj_cache import HybridCache
 from .nj_contract import DEFAULT_TOPICS, handle_decisions
 from .nj_engine import Labeler, classify
-from .nj_guard import GuardPolicy
-from .nj_hybrid import HybridPolicy
+from .nj_guard import GuardPolicy, PromptInjectionError
+from .nj_hybrid import BudgetExceededError, HybridPolicy
 from .nj_llm import OpenAICompatJudge, make_hybrid_labeler
 from .nj_openai import handle_chat, handle_chat_stream, wants_stream
 
@@ -57,6 +57,9 @@ _labeler: Labeler | None = None
 
 #: 级联模式下的缓存句柄（关闭时为空缓存，用于在 ``/health`` 报 0 命中）。
 _cache: HybridCache = HybridCache(namespace="")
+
+#: 级联运行计数：判断条数、升级条数、模型/契约错误数。
+_metrics: dict[str, int] = {"labels": 0, "escalated": 0, "llm_errors": 0}
 
 #: 对外暴露的模型对象（OpenAI 风格），``/v1/models`` 与其子路径共用。
 _MODEL: dict[str, Any] = {"id": "nano-jev", "object": "model", "owned_by": "nano_jev"}
@@ -117,6 +120,7 @@ def configure_hybrid(
     ``"<模型 id>/<提示词版本>"`` 作为命名空间，避免换模型后读到旧结论。
     """
     global _labeler, _cache
+    _metrics.update(labels=0, escalated=0, llm_errors=0)
     if judge is None:
         _labeler = None
         _cache = HybridCache(namespace="")
@@ -131,13 +135,27 @@ def configure_hybrid(
         guard=guard,
         cache=_cache if _cache.enabled else None,
         topics=topics if topics is not None else _topics,
+        on_result=_record_result,
     )
     return _cache
 
 
+def _record_result(result: Any) -> None:
+    """累计级联运行计数；由 labeler 在每条判断后回调。"""
+    _metrics["labels"] += 1
+    if getattr(result, "escalated", False):
+        _metrics["escalated"] += 1
+    if getattr(result, "llm_error", None) is not None:
+        _metrics["llm_errors"] += 1
+
+
 def hybrid_status() -> dict[str, object]:
     """级联后端的只读状态，供 ``/health`` 与排障使用。"""
-    return {"hybrid": _labeler is not None, "cache": _cache.stats()}
+    return {
+        "hybrid": _labeler is not None,
+        "cache": _cache.stats(),
+        "metrics": dict(_metrics),
+    }
 
 
 def apply_config(topics: Sequence[str] | None = None, token: str | None = None) -> None:
@@ -405,6 +423,20 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._send_error_json(f"未知路径：{path}", 404, 404)
                 return
+        except PromptInjectionError as exc:
+            # 输入命中注入模式且策略为 raise：这是**客户端**的输入问题，不是服务故障。
+            # 之前落到通用 Exception 分支回 500，会让调用方误以为是服务端 bug 并重试。
+            self._send_error_json(f"输入被拒绝：{exc}", 400, 400)
+            return
+        except BudgetExceededError as exc:
+            # 升级配额耗尽：语义上是"稍后再试"，用 429 而不是 500。
+            self._send_error_json(f"升级配额已耗尽：{exc}", 429, 429)
+            return
+        except ValueError as exc:
+            # 模型返回了不合契约的内容（越界字段/非 JSON 等）：上游错误，回 502。
+            traceback.print_exc(file=sys.stderr)
+            self._send_error_json(f"模型返回不合契约：{exc}", 502, 502)
+            return
         except Exception:
             # 异常细节只进服务端日志：对外回泛化文案，避免把内部结构/路径泄给调用方。
             # log_message 被静音了，故这里显式打到 stderr，否则排障时一片空白。
@@ -510,6 +542,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="粗筛置信度低于该值时升级（启发式门槛，不是校准概率）",
     )
     serve_parser.add_argument(
+        "--hybrid-timeout", type=float, default=60.0, help="单次模型调用超时秒数"
+    )
+    serve_parser.add_argument(
         "--hybrid-guard",
         choices=("off", "flag", "block", "raise"),
         default="flag",
@@ -555,7 +590,9 @@ def _configure_hybrid_from_args(args: argparse.Namespace) -> None:
         injection_action=args.hybrid_guard
     )
     configure_hybrid(
-        OpenAICompatJudge(endpoint=endpoint, model=model, api_key=api_key),
+        OpenAICompatJudge(
+            endpoint=endpoint, model=model, api_key=api_key, timeout=args.hybrid_timeout
+        ),
         policy=HybridPolicy(minimum_confidence=args.hybrid_min_confidence),
         guard=guard,
         cache_namespace=args.hybrid_cache_namespace,

@@ -194,6 +194,8 @@ results = judge_many(
 * 缓存只存升级后的结果，命中返回深拷贝；`stats()` 给出命中率、条目数与淘汰数。
 * `judge_many(workers=N)` 并发调用模型，结果顺序与输入一致；预算的 `consume()`
   是原子的，并发下不会超发。
+* **并发相同请求会合并**：第一个请求调用模型，其余等待并复用结果（single-flight），
+  避免 8 个相同请求各付一次调用。`stats()` 的 `coalesced` 即被合并的次数。
 
 ## 服务化（可选级联后端）
 
@@ -209,7 +211,10 @@ python3 -m nano_jev.nj_server serve \
 * 配置后，`/alpha/decisions` 与 `/v1/chat/completions`（含流式）都会先粗筛、按策略升级。
 * `/health` 返回 `hybrid` 开关与缓存命中统计。
 * 端点、模型与密钥也可用 `NANO_JV_LLM_ENDPOINT` / `NANO_JV_LLM_MODEL` /
-  `NANO_JV_LLM_API_KEY` 提供。
+  `NANO_JV_LLM_API_KEY` 提供；`--hybrid-timeout` 控制单次调用超时。
+* 错误语义：输入触发注入且策略为 `raise` → **400**；升级配额耗尽 → **429**；
+  模型返回不合契约 → **502**；其余内部错误 → 500。
+* `/health` 的 `metrics` 给出判断条数、升级条数与模型错误数。
 
 库内装配见 [`examples/llm_judge_openai.py`](examples/llm_judge_openai.py)：
 `OpenAICompatJudge` 只用标准库 `urllib`，可直接传给 `judge_hybrid`。
@@ -220,7 +225,7 @@ python3 -m nano_jev.nj_server serve \
 | --- | --- | --- |
 | POST | `/alpha/decisions` | Jev 原生契约：`{model, state:{comments}, questions}` → `{answers, usage, …}` |
 | POST | `/v1/chat/completions` | OpenAI 兼容：`{model, messages}` → 标准 chat completion；`"stream": true` 时回 `text/event-stream` 增量帧 |
-| GET | `/health` | 健康检查、版本、级联开关与缓存统计 |
+| GET | `/health` | 健康检查、版本、级联开关、缓存统计与运行计数 |
 | GET | `/v1/models` | OpenAI 风格的模型清单 |
 | GET | `/v1/models/{model}` | 单个模型对象；未知模型回 404 |
 
@@ -236,7 +241,9 @@ python3 -m nano_jev.nj_server serve \
 | 404 | 未知路径 |
 | 405 | 已知路径但方法不对；响应带 `Allow` 头。**不再**落到 Python 默认的 HTML 501 |
 | 413 | 请求体超过 32 MiB |
+| 429 | 升级配额耗尽（仅级联模式） |
 | 500 | 内部错误；详情只进服务端 stderr，对外回泛化文案，不泄露异常原文 |
+| 502 | 模型输出不合契约（非法 JSON、越界字段） |
 
 `OPTIONS` 回 204 + `Allow`，便于客户端探测可用方法。
 
