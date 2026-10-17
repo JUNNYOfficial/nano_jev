@@ -35,6 +35,15 @@ from .nj_contract import (
     parse_decisions_request,
 )
 from .nj_engine import Label, classify, estimate_tokens
+from .nj_hybrid import (
+    BudgetExceededError,
+    HybridBudget,
+    HybridPolicy,
+    HybridResult,
+    LLMJudge,
+    judge_hybrid,
+    judge_many,
+)
 from .nj_vocab import ASPECTS, EMOTIONS, INTENTS, MAX_ASPECTS, MAX_EMOTIONS, SENTIMENTS
 
 __all__ = [
@@ -46,14 +55,21 @@ __all__ = [
     "MAX_EMOTIONS",
     "SENTIMENTS",
     "VERSION",
+    "BudgetExceededError",
     "DecisionsRequest",
+    "HybridBudget",
+    "HybridPolicy",
+    "HybridResult",
+    "LLMJudge",
     "Label",
     "build_answers",
     "build_decisions_response",
     "classify",
     "estimate_tokens",
+    "judge_hybrid",
+    "judge_many",
     "parse_decisions_request",
 ]
 
 #: 运行时版本号，随 ``/health`` 与 ``/v1/models`` 返回，便于排查「装的是哪版」。
-VERSION = "1.0.0"
+VERSION = "1.1.0"

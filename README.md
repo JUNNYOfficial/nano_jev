@@ -56,7 +56,7 @@ nano-jev --version                # confirm which version is installed
 nano-jev serve --port 8765        # equivalent to python -m nano_jev.nj_server
 ```
 
-The wheel ships only the package body (7 modules + `py.typed`), not `tests/`.
+The wheel ships only the package body (8 modules + `py.typed`), not `tests/`.
 
 
 ## Wiring into jev-arena (two ways)
@@ -87,6 +87,70 @@ This side also aligns with official OpenAI in two ways, so most clients plug in 
 * **Candidate count `n`**: accepts `n` (1–8). Since this service is deterministic, the
   `n` candidates carry identical content; this is shape compatibility only.
 * **Model discovery**: `GET /v1/models` lists models, `GET /v1/models/nano-jev` returns a single one.
+
+## Cascading to an LLM (Hybrid)
+
+`nano_jev` remains an independent, zero-dependency coarse classifier. The cascade
+orchestrator accepts an injected LLM callback and does not bind to any provider or SDK.
+By default, it escalates labels with heuristic confidence below `0.65` or `mixed`
+sentiment. This score is **not a calibrated probability**; treat the default threshold as
+a starting point and tune it against labeled examples from the target domain.
+
+```python
+from nano_jev import HybridPolicy, Label, judge_hybrid
+
+def llm_judge(text: str, nano_label: Label) -> Label:
+    # Call the LLM here and map its controlled structured output to Label.
+    # The coarse label is a hint; the returned model label is authoritative.
+    ...
+
+result = judge_hybrid(
+    "c0",
+    "This model answers well at times, but it also makes things up.",
+    llm_judge=llm_judge,
+    policy=HybridPolicy(minimum_confidence=0.65),
+)
+print(result.source, result.escalation_reasons, result.label.to_raw())
+```
+
+If escalation is required but no callback was supplied, `judge_hybrid` raises
+`RuntimeError` rather than presenting an unreviewed coarse result as an LLM judgment.
+Model-call errors propagate by default; set `HybridPolicy(on_llm_error="nano")` to fall
+back to the coarse result and record the exception type. Each result records its source,
+whether it was escalated, the coarse label, LLM latency, and the escalation reasons,
+making accuracy, escalation rate, latency, and token cost measurable.
+
+Model output is not trusted as-is: `sentiment` / `intent` / `aspects` / `emotion` are
+normalized to the controlled vocabulary, out-of-range `confidence` / `sentiment_score`
+values are clamped, and an `evidence_quote` that is not a verbatim substring of the source
+falls back to the coarse extractor's quote. Every rewrite is recorded in
+`HybridResult.normalizations` and `label.meta["hybrid"]`.
+
+Cost and batching:
+
+```python
+from nano_jev import HybridBudget, judge_many
+
+budget = HybridBudget(limit=100)          # shared across requests
+results = judge_many(
+    [{"comment_id": "c0", "content": "..."}, {"comment_id": "c1", "content": "..."}],
+    llm_judge=llm_judge,
+    budget=budget,
+)
+# On exhaustion the default is to return the coarse result with a
+# "budget_exhausted" reason; use HybridPolicy(on_budget_exhausted="raise")
+# to fail loudly instead.
+```
+
+The default route escalates on low confidence or `mixed` sentiment. Enable
+`minimum_content_length`, `escalate_irrelevant`, and `escalate_without_aspects` to widen
+the escalation surface for higher-risk domains.
+
+```text
+Input → nano_jev coarse judgment → lightweight routing policy
+                                    ├─ low risk → return coarse label
+                                    └─ ambiguous/conflicting → injected LLM → structured label
+```
 
 ## HTTP API
 
@@ -153,6 +217,7 @@ precedence over environment variables.
 | `nj_vocab.py` | Controlled vocabulary and normalization, aligned item-by-item with jev-arena `vocab.mjs` |
 | `nj_lexicon.py` | Bilingual (Chinese/English) polarity/intent/aspect/emotion/topic cues — the only place to extend |
 | `nj_engine.py` | Coarse classifier: one text → one set of structured labels (pure function, deterministic) |
+| `nj_hybrid.py` | Cascade orchestration: coarse screen → lightweight routing → optional LLM review (provider-agnostic) |
 | `nj_contract.py` | Parsing and response construction for the Jev `/alpha/decisions` contract |
 | `nj_openai.py` | OpenAI `/chat/completions` adapter layer (including streaming SSE) |
 | `nj_server.py` | Zero-dependency HTTP service and command-line entry point |
@@ -164,9 +229,11 @@ precedence over environment variables.
 ### Module relationships
 
 Dependencies are one-way: **entry point → contract/adapter → engine → vocabulary**. The
-two contract chains (native Jev, OpenAI-compatible) don't reference each other; they share
-only the same deterministic core `nj_engine.classify()`. `nj_vocab` / `nj_lexicon` are the
-leaves being depended on, and the only places that need to grow when following upstream.
+two serving contract chains (native Jev, OpenAI-compatible) don't reference each other;
+they share the same deterministic core `nj_engine.classify()`. `nj_hybrid` is an optional
+library-level orchestrator: it uses that core and calls an injected LLM only when routing
+rules request escalation. The HTTP serving endpoints remain deterministic and do not call
+an LLM.
 
 ```mermaid
 graph LR
@@ -181,6 +248,8 @@ graph LR
     end
 
     ENGINE["nj_engine.py<br/>coarse classifier classify()"]
+    HYBRID["nj_hybrid.py<br/>cascade routing + injected model callback"]
+    LLM["Caller-provided LLM"]
 
     subgraph vocab["Vocabulary & constants"]
         VOCAB["nj_vocab.py<br/>controlled vocabulary & normalization"]
@@ -195,6 +264,8 @@ graph LR
     CONTRACT --> VOCAB
     CONTRACT --> LEXICON
     OPENAI --> ENGINE
+    HYBRID --> ENGINE
+    HYBRID -. "escalated cases only" .-> LLM
     ENGINE --> VOCAB
     ENGINE --> LEXICON
 ```
@@ -250,7 +321,7 @@ the server tests **really start a server and make real HTTP requests**:
 
 ```bash
 python3 -m pytest nano_jev/tests/test_nj_engine.py nano_jev/tests/test_nj_contract.py \
-                nano_jev/tests/test_nj_openai.py -q
+                nano_jev/tests/test_nj_openai.py nano_jev/tests/test_nj_hybrid.py -q
 python3 -m pytest nano_jev/tests/test_nj_server.py -q
 ```
 

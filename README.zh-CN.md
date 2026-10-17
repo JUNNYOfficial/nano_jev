@@ -52,7 +52,7 @@ nano-jev --version                # 确认装的是哪版
 nano-jev serve --port 8765        # 等价于 python -m nano_jev.nj_server
 ```
 
-装出来的 wheel 只含包本体（7 个模块 + `py.typed`），不含 `tests/`。
+装出来的 wheel 只含包本体（8 个模块 + `py.typed`），不含 `tests/`。
 
 
 ## 接进 jev-arena（两种方式）
@@ -80,6 +80,64 @@ export OPENROUTER_BASE_URL=http://127.0.0.1:8765   # 别再指向 openrouter.ai
   `chat.completion.chunk` 逐帧推送，末帧为 `data: [DONE]`。
 * **候选数 `n`**：接受 `n`（1–8）。因本服务确定，`n` 个候选内容相同，仅做形状兼容。
 * **模型探测**：`GET /v1/models` 列清单，`GET /v1/models/nano-jev` 取单项。
+
+## 与大模型级联（Hybrid）
+
+`nano_jev` 继续作为独立的零依赖粗筛器；级联编排层由调用方注入大模型回调，不绑定
+OpenAI 或其他 SDK。默认在启发式置信分低于 `0.65` 或判断为 `mixed` 时升级。该分数
+不是校准概率，默认门槛只是启动值，应通过目标领域的标注集评测后调整。
+
+```python
+from nano_jev import HybridPolicy, Label, judge_hybrid
+
+def llm_judge(text: str, nano_label: Label) -> Label:
+    # 在这里调用你选用的大模型，并把受控结构化输出映射为 Label。
+    # nano_label 是提示线索；升级后的标签以模型输出为准。
+    ...
+
+result = judge_hybrid(
+    "c0",
+    "这个模型有时答得很好，但也会编造事实",
+    llm_judge=llm_judge,
+    policy=HybridPolicy(minimum_confidence=0.65),
+)
+print(result.source, result.escalation_reasons, result.label.to_raw())
+```
+
+如果样本需要升级却没有提供模型回调，`judge_hybrid` 会抛出 `RuntimeError`，不会静默
+把未经复核的粗筛结论当成模型判断。模型调用错误默认原样向上抛；设置
+`HybridPolicy(on_llm_error="nano")` 才退回粗筛结果，并在结果里记录异常类型。每个结果都
+带有 `source`、`escalated`、`coarse_label`、`llm_duration_ms` 与升级原因，便于离线评估
+准确率、升级率、延迟和 token 成本。
+
+模型输出不会被原样信任：`sentiment` / `intent` / `aspects` / `emotion` 会按受控词表
+归一，越界的 `confidence` / `sentiment_score` 会被夹到合法区间，不在原文中的
+`evidence_quote` 会退回粗筛器摘出的逐字引文。发生的规范化记录在
+`HybridResult.normalizations` 与 `label.meta["hybrid"]` 中。
+
+成本与批量：
+
+```python
+from nano_jev import HybridBudget, judge_many
+
+budget = HybridBudget(limit=100)          # 跨请求共享升级次数
+results = judge_many(
+    [{"comment_id": "c0", "content": "..."}, {"comment_id": "c1", "content": "..."}],
+    llm_judge=llm_judge,
+    budget=budget,
+)
+# 预算耗尽时默认退回粗筛结果，并带 "budget_exhausted" 原因；
+# 要求直接失败则设 HybridPolicy(on_budget_exhausted="raise")。
+```
+
+默认只在低置信度或 `mixed` 时升级；还可启用 `minimum_content_length`、
+`escalate_irrelevant` 与 `escalate_without_aspects`，按业务风险扩大升级面。
+
+```text
+输入 → nano_jev 确定性初筛 → 轻量路由策略
+                              ├─ 低风险 → 直接返回粗筛标签
+                              └─ 模糊/冲突 → 注入的大模型 → 结构化标签
+```
 
 ## HTTP 接口
 
@@ -140,6 +198,7 @@ python -m nano_jev.nj_server --version
 | `nj_vocab.py` | 受控词表与归一，与 jev-arena `vocab.mjs` 逐项对齐 |
 | `nj_lexicon.py` | 中英双语的极性/意图/维度/情绪/主题线索（唯一需要扩充的地方） |
 | `nj_engine.py` | 粗筛引擎：一条文本 → 一套结构化标签（纯函数、确定性） |
+| `nj_hybrid.py` | 级联编排：初筛 → 轻量路由 → 可选的大模型复核（供应商无关） |
 | `nj_contract.py` | Jev `/alpha/decisions` 契约的解析与响应构造 |
 | `nj_openai.py` | OpenAI `/chat/completions` 适配层（含流式 SSE） |
 | `nj_server.py` | 零依赖 HTTP 服务与命令行入口 |
@@ -181,6 +240,9 @@ graph LR
     CONTRACT --> VOCAB
     CONTRACT --> LEXICON
     OPENAI --> ENGINE
+    HYBRID["nj_hybrid.py<br/>级联路由与模型回调"]
+    HYBRID --> ENGINE
+    HYBRID -. "仅疑难样本" .-> LLM["调用方注入的大模型"]
     ENGINE --> VOCAB
     ENGINE --> LEXICON
 ```
@@ -234,7 +296,7 @@ python3 -m pytest nano_jev/ -q
 
 ```bash
 python3 -m pytest nano_jev/tests/test_nj_engine.py nano_jev/tests/test_nj_contract.py \
-                nano_jev/tests/test_nj_openai.py -q
+                nano_jev/tests/test_nj_openai.py nano_jev/tests/test_nj_hybrid.py -q
 python3 -m pytest nano_jev/tests/test_nj_server.py -q
 ```
 
