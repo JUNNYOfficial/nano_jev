@@ -167,7 +167,7 @@ result = judge_hybrid(
 | Capability | Behavior |
 | --- | --- |
 | PII redaction | Emails, phone numbers, national IDs, bank cards, and common API keys become `[EMAIL]`-style placeholders before the model sees them |
-| Checksum filtering | Chinese IDs are validated per GB 11643-1999, bank cards by Luhn; **numbers that fail validation are left untouched** |
+| Checksum filtering | Chinese IDs are validated per GB 11643-1999 **including the birth-date segment**, bank cards by Luhn; **numbers that fail validation are left untouched** |
 | Number precision | Mainland mobiles only (`1[3-9]`, optional `86`); international numbers require an explicit `+`; landlines require an area-code separator |
 | Truncation | With `max_chars > 0`, the text is truncated and flagged as `truncated` |
 | Injection detection | Matches "ignore previous instructions", "reveal your system prompt", and Chinese equivalents; `flag` records, `block` skips escalation, `raise` raises `PromptInjectionError` |
@@ -176,6 +176,9 @@ result = judge_hybrid(
 
 Checksums buy **fewer false positives**: `2024010112345678` (an order id),
 `1700000000` (a timestamp), and IDs with a bad check digit are no longer redacted.
+The same applies to IDs whose birth date cannot exist (month 13, Feb 30,
+Feb 29 in a non-leap year): those can still produce a valid check digit, so a
+checksum alone would have redacted them.
 The cost is **misses**: real data with a wrong check digit or an international number
 without `+` is not detected. For "redact before sending to a model", a miss is safer
 than corrupting the text.

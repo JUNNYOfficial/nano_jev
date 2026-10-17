@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
 #: 中国居民身份证的加权因子与校验码表（GB 11643-1999）。
@@ -43,12 +44,40 @@ def luhn_valid(number: str) -> bool:
     return total % 10 == 0
 
 
+#: 身份证出生日期的合理年份下界（1980 年前签发的号码已不再使用）。
+_ID_EARLIEST_YEAR = 1900
+
+
+def _valid_birth_date(year: int, month: int, day: int) -> bool:
+    """出生日期段是否合法：年份合理、月份 1–12、日与月份/闰年匹配。"""
+    if not _ID_EARLIEST_YEAR <= year <= datetime.now().year:
+        return False
+    if not 1 <= month <= 12:
+        return False
+    if day < 1:
+        return False
+    if month == 2:
+        leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+        return day <= (29 if leap else 28)
+    return day <= (30 if month in (4, 6, 9, 11) else 31)
+
+
 def chinese_id_valid(number: str) -> bool:
-    """中国 18 位身份证校验位。前 17 位必须是数字，末位可为 X。"""
+    """中国 18 位身份证：校验位 + 出生日期段。
+
+    只校验校验位是不够的——`11010119901301...` 这类 13 月的号码能凑出正确校验位，
+    但它不可能是真实证件。日期段校验把这类"形状合法但语义不可能"的号码挡掉，
+    避免把它们当成 PII 替换（那会破坏原文，还可能让下游误判）。
+    """
     candidate = number.strip().upper()
     if len(candidate) != 18 or not candidate[:17].isdigit():
         return False
     if candidate[17] not in "0123456789X":
+        return False
+    year = int(candidate[6:10])
+    month = int(candidate[10:12])
+    day = int(candidate[12:14])
+    if not _valid_birth_date(year, month, day):
         return False
     total = sum(int(char) * weight for char, weight in zip(candidate[:17], _ID_WEIGHTS))
     return _ID_CHECKSUM[total % 11] == candidate[17]

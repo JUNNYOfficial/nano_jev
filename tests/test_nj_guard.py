@@ -237,3 +237,38 @@ def test_custom_rules_run_before_shape_rules():
 
     assert "[TICKET]" in prepared.text
     assert "ok@example.com" in prepared.text  # 未启用 email 规则
+
+
+def _make_id(body17: str) -> str:
+    """按 GB 11643-1999 补上校验位，用于构造测试号码。"""
+    weights = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+    checksum = "10X98765432"
+    total = sum(int(char) * weight for char, weight in zip(body17, weights))
+    return body17 + checksum[total % 11]
+
+
+def test_id_rejects_impossible_birth_dates():
+    """回归：只看校验位会让 13 月、2 月 30 日这类号码通过。"""
+    for body in (
+        "11010119901301123",  # 13 月
+        "11010119900230123",  # 2 月 30 日
+        "11010119900229123",  # 非闰年 2 月 29 日
+        "11010119900300123",  # 日 = 00
+        "11010118000307123",  # 年份过早
+    ):
+        value = _make_id(body)
+        assert chinese_id_valid(value) is False, value
+
+
+def test_id_accepts_leap_day_and_ordinary_dates():
+    assert chinese_id_valid(_make_id("11010119920229123")) is True  # 闰年 2 月 29
+    assert chinese_id_valid(_make_id("11010120000229123")) is True  # 400 年整除
+    assert chinese_id_valid(_make_id("11010119000228123")) is True  # 1900 非闰年 2/28
+
+
+def test_id_with_impossible_date_is_not_redacted():
+    value = _make_id("11010119901301123")
+    redacted, matches = redact_pii(f"身份证 {value}")
+
+    assert value in redacted
+    assert matches == ()
